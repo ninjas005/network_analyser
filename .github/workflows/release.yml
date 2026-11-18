@@ -98,6 +98,7 @@ jobs:
           cp assets/network-analyser.desktop $root/share/applications/
           cp assets/icon-512.png $root/share/icons/hicolor/512x512/apps/network-analyser.png
           cp README.md LICENSE $root/
+          cp packaging/linux/install.sh $root/ && chmod +x $root/install.sh
           tar czf dist/$root.tar.gz $root
           dpkg-deb --info dist/*.deb | sed -n '/Depends/p'
           ls -la dist
@@ -176,7 +177,7 @@ jobs:
           path: out/*
 
   windows:
-    name: Windows x86_64 (.zip)
+    name: Windows x86_64 (setup.exe, .zip)
     needs: [oui, version]
     runs-on: windows-latest
     steps:
@@ -196,6 +197,16 @@ jobs:
           Copy-Item "target/release/$env:APP.exe" $root/
           Copy-Item assets/oui.txt, README.md, LICENSE $root/
           Compress-Archive -Path $root -DestinationPath "out/$root.zip"
+          # Installer (Inno Setup; installed on demand if the image lacks it)
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
+            if ($LASTEXITCODE -ne 0) { throw "Inno Setup install failed" }
+          }
+          $stage = (Resolve-Path $root).Path
+          $outDir = (Resolve-Path out).Path
+          & $iscc /Q "/DAppVersion=$v" "/DStageDir=$stage" "/DOutputDir=$outDir" packaging\windows\installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
           Get-ChildItem out
       - uses: actions/upload-artifact@v4
         with:

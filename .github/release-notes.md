@@ -4,9 +4,10 @@
 |---|---|---|
 | Debian / Ubuntu / Mint / Pop!_OS | `network-analyser_*_amd64.deb` | `sudo apt install ./network-analyser_*_amd64.deb` |
 | Fedora / RHEL / openSUSE | `network-analyser-*.x86_64.rpm` | `sudo dnf install ./network-analyser-*.rpm` (or `zypper install`) |
-| Any Linux (glibc 2.35+) | `network-analyser-*-linux-x86_64.tar.gz` | extract, run `bin/network_analyser` |
+| Any Linux (glibc 2.35+) | `network-analyser-*-linux-x86_64.tar.gz` | extract, then `./install.sh` (per-user) or `sudo ./install.sh` (system-wide). `--uninstall` removes it |
 | macOS 11+ (Apple Silicon & Intel) | `network-analyser-*-macos-universal.dmg` | drag to Applications — see note below |
-| Windows 10/11 x64 | `network-analyser-*-windows-x86_64.zip` | extract, run `network_analyser.exe` |
+| **Windows 10/11 x64 (installer)** | `network-analyser-*-windows-x86_64-setup.exe` | run it. Adds Start-menu shortcuts (normal, kiosk, windowed), an optional desktop icon, and an uninstaller in *Apps & features* |
+| Windows 10/11 x64 (portable) | `network-analyser-*-windows-x86_64.zip` | extract, run `network_analyser.exe` |
 
 `SHA256SUMS.txt` has checksums for every file.
 
@@ -15,7 +16,7 @@
 **macOS:** the app is not notarized. On first launch, right-click → **Open**, or run
 `xattr -dr com.apple.quarantine "/Applications/Network Analyser.app"`. Allow **Local Network** access when prompted.
 
-**Windows:** SmartScreen may warn about an unsigned app. Click **More info → Run anyway**.
+**Windows:** the installer and exe are unsigned, so SmartScreen may warn. Click **More info → Run anyway**. Users without admin rights can choose *Install for me only*.
 
 ## Usage
 
