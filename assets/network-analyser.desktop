@@ -1,0 +1,20 @@
+[Desktop Entry]
+Type=Application
+Name=Network Analyser
+GenericName=Network Scanner
+Comment=Find devices on your network: hostnames, open ports, vendors and more
+Exec=network_analyser
+Icon=network-analyser
+Terminal=false
+Categories=Network;Monitor;System;
+Keywords=network;scanner;ip;lan;port;ping;
+StartupWMClass=network-analyser
+Actions=Kiosk;Windowed;
+
+[Desktop Action Kiosk]
+Name=Kiosk mode (scan on start)
+Exec=network_analyser --kiosk --scan
+
+[Desktop Action Windowed]
+Name=Windowed
+Exec=network_analyser --windowed

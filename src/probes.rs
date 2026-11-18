@@ -16,31 +16,48 @@ pub struct PingReply {
 }
 
 /// ICMP echo via the system `ping` binary (it carries the raw-socket
-/// capability, so this app needs no root privileges).
+/// privilege on every OS, so this app needs no root/admin rights).
 pub async fn ping(ip: Ipv4Addr, wait: Duration) -> Option<PingReply> {
+    let ip_s = ip.to_string();
+    let ms = wait.as_millis().max(500).to_string();
     let secs = wait.as_secs().max(1).to_string();
+    let args: Vec<&str> = if cfg!(windows) {
+        vec!["-n", "1", "-w", &ms, &ip_s]
+    } else if cfg!(target_os = "macos") {
+        vec!["-n", "-c", "1", "-t", &secs, &ip_s]
+    } else {
+        vec!["-n", "-c", "1", "-W", &secs, &ip_s]
+    };
     let start = Instant::now();
-    let out = tokio::process::Command::new("ping")
-        .args(["-n", "-c", "1", "-W", &secs, &ip.to_string()])
-        .env("LC_ALL", "C")
+    let out = crate::platform::async_command("ping")
+        .args(&args)
         .kill_on_drop(true)
         .output()
         .await
         .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let line = text.lines().find(|l| l.contains("ttl="))?;
-    let field = |key: &str| {
-        line.split_whitespace()
-            .find_map(|w| w.strip_prefix(key))
-            .map(|v| v.to_string())
+    parse_ping(&String::from_utf8_lossy(&out.stdout), start.elapsed())
+}
+
+/// Needs a reply line carrying a TTL; that also filters out Windows'
+/// "Destination host unreachable" answers (which exit with status 0).
+fn parse_ping(text: &str, elapsed: Duration) -> Option<PingReply> {
+    let line = text
+        .lines()
+        .find(|l| l.to_ascii_lowercase().contains("ttl="))?;
+    let lower = line.to_ascii_lowercase();
+    let value_after = |key: &str| {
+        let i = lower.find(key)? + key.len();
+        let v: String = lower[i..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        v.parse::<f32>().ok()
     };
-    let ttl = field("ttl=").and_then(|v| v.parse().ok());
-    let rtt_ms = field("time=")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(start.elapsed().as_secs_f32() * 1000.0);
+    let ttl = value_after("ttl=").map(|t| t as u8);
+    // Linux/macOS "time=3.21 ms", Windows "time=3ms" or "time<1ms".
+    let rtt_ms = value_after("time=")
+        .or_else(|| value_after("time<").map(|v| v.min(1.0)))
+        .unwrap_or(elapsed.as_secs_f32() * 1000.0);
     Some(PingReply { rtt_ms, ttl })
 }
 
@@ -80,10 +97,11 @@ pub async fn grab_banner(ip: Ipv4Addr, port: u16, http_hint: bool) -> Banner {
     let mut buf = vec![0u8; 4096];
     if !http_hint
         && let Ok(Ok(n)) = timeout(Duration::from_millis(1200), s.read(&mut buf)).await
-            && n > 0 {
-                out.text = Some(clean_line(&buf[..n]));
-                return out;
-            }
+        && n > 0
+    {
+        out.text = Some(clean_line(&buf[..n]));
+        return out;
+    }
     let req = format!(
         "GET / HTTP/1.0\r\nHost: {ip}\r\nUser-Agent: Mozilla/5.0 (network-analyser)\r\nAccept: */*\r\n\r\n"
     );
@@ -128,10 +146,16 @@ fn clean_line(bytes: &[u8]) -> String {
 }
 
 fn header(resp: &str, name: &str) -> Option<String> {
-    resp.split("\r\n\r\n").next()?.lines().skip(1).find_map(|l| {
-        let (k, v) = l.split_once(':')?;
-        k.trim().eq_ignore_ascii_case(name).then(|| v.trim().to_string())
-    })
+    resp.split("\r\n\r\n")
+        .next()?
+        .lines()
+        .skip(1)
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| v.trim().to_string())
+        })
 }
 
 /// Case-insensitive `<tag>...</tag>` extraction (handles `<tag attr>` and XML).
@@ -292,9 +316,15 @@ pub async fn netbios(ip: Ipv4Addr) -> Option<NetbiosInfo> {
     }
     let mac_off = rdata + 1 + count * 18;
     if let Some(m) = r.get(mac_off..mac_off + 6)
-        && m.iter().any(|b| *b != 0) {
-            info.mac = Some(m.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":"));
-        }
+        && m.iter().any(|b| *b != 0)
+    {
+        info.mac = Some(
+            m.iter()
+                .map(|b| format!("{b:02X}"))
+                .collect::<Vec<_>>()
+                .join(":"),
+        );
+    }
     (info.name.is_some() || info.group.is_some()).then_some(info)
 }
 
@@ -319,16 +349,17 @@ pub async fn upnp(ip: Ipv4Addr) -> Option<UpnpInfo> {
         ..Default::default()
     };
     if let Some(loc) = header(&format!("{text}\r\n\r\n"), "location")
-        && let Some(xml) = http_get_url(&loc, ip).await {
-            info.friendly_name = html_tag(&xml, "friendlyName");
-            info.manufacturer = html_tag(&xml, "manufacturer");
-            info.model = html_tag(&xml, "modelName").map(|m| match html_tag(&xml, "modelNumber") {
-                Some(n) if !m.contains(&n) => format!("{m} {n}"),
-                _ => m,
-            });
-            info.device_type = html_tag(&xml, "deviceType")
-                .map(|t| t.split(':').rev().nth(1).unwrap_or(&t).to_string());
-        }
+        && let Some(xml) = http_get_url(&loc, ip).await
+    {
+        info.friendly_name = html_tag(&xml, "friendlyName");
+        info.manufacturer = html_tag(&xml, "manufacturer");
+        info.model = html_tag(&xml, "modelName").map(|m| match html_tag(&xml, "modelNumber") {
+            Some(n) if !m.contains(&n) => format!("{m} {n}"),
+            _ => m,
+        });
+        info.device_type = html_tag(&xml, "deviceType")
+            .map(|t| t.split(':').rev().nth(1).unwrap_or(&t).to_string());
+    }
     Some(info)
 }
 
@@ -336,18 +367,28 @@ pub async fn upnp(ip: Ipv4Addr) -> Option<UpnpInfo> {
 /// LOCATION header to some other machine).
 async fn http_get_url(url: &str, expect_ip: Ipv4Addr) -> Option<String> {
     let rest = url.strip_prefix("http://")?;
-    let (hostport, path) = rest.split_once('/').map(|(h, p)| (h, format!("/{p}"))).unwrap_or((rest, "/".into()));
+    let (hostport, path) = rest
+        .split_once('/')
+        .map(|(h, p)| (h, format!("/{p}")))
+        .unwrap_or((rest, "/".into()));
     let (host, port) = hostport.split_once(':').unwrap_or((hostport, "80"));
     let ip: Ipv4Addr = host.parse().ok()?;
     if ip != expect_ip {
         return None;
     }
     let port: u16 = port.parse().ok()?;
-    let mut s = timeout(Duration::from_millis(1500), TcpStream::connect((ip, port))).await.ok()?.ok()?;
+    let mut s = timeout(Duration::from_millis(1500), TcpStream::connect((ip, port)))
+        .await
+        .ok()?
+        .ok()?;
     let req = format!("GET {path} HTTP/1.0\r\nHost: {hostport}\r\nConnection: close\r\n\r\n");
     s.write_all(req.as_bytes()).await.ok()?;
     let mut data = Vec::new();
-    let _ = timeout(Duration::from_millis(2500), s.take(64 * 1024).read_to_end(&mut data)).await;
+    let _ = timeout(
+        Duration::from_millis(2500),
+        s.take(64 * 1024).read_to_end(&mut data),
+    )
+    .await;
     (!data.is_empty()).then(|| String::from_utf8_lossy(&data).to_string())
 }
 
@@ -362,6 +403,22 @@ pub async fn reverse_dns(ip: Ipv4Addr) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ping_output_formats() {
+        let z = Duration::ZERO;
+        let l = parse_ping(
+            "64 bytes from 192.168.29.1: icmp_seq=1 ttl=64 time=3.29 ms",
+            z,
+        )
+        .unwrap();
+        assert_eq!((l.ttl, l.rtt_ms), (Some(64), 3.29));
+        let w = parse_ping("Reply from 192.168.1.1: bytes=32 time=4ms TTL=128", z).unwrap();
+        assert_eq!((w.ttl, w.rtt_ms), (Some(128), 4.0));
+        let w = parse_ping("Reply from 192.168.1.1: bytes=32 time<1ms TTL=64", z).unwrap();
+        assert_eq!((w.ttl, w.rtt_ms), (Some(64), 1.0));
+        assert!(parse_ping("Reply from 192.168.1.20: Destination host unreachable.", z).is_none());
+    }
 
     #[test]
     fn title_extraction() {
