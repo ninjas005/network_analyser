@@ -1,4 +1,8 @@
+// Windows: GUI app without a console window (see attach_parent_console).
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod netinfo;
+mod platform;
 mod probes;
 mod scanner;
 mod ui;
@@ -10,7 +14,10 @@ use gpui::{
     WindowDecorations, WindowKind, WindowOptions, point, px, size,
 };
 
-use ui::{CancelDialog, ClearSearch, Export, FocusSearch, Quit, RequestQuit, ScannerView, StartStop, ToggleFilter, ToggleFullscreen};
+use ui::{
+    CancelDialog, ClearSearch, Export, FocusSearch, Quit, RequestQuit, ScannerView, StartStop,
+    ToggleFilter, ToggleFullscreen,
+};
 
 const USAGE: &str = "\
 network_analyser - lightweight LAN scanner
@@ -25,6 +32,8 @@ OPTIONS:
                   the Quit button, Esc (with confirmation) or Ctrl+Q
     --windowed    Open in a normal window (development)
     --scan        Start scanning the local subnet immediately
+    --x11         Linux: force X11 (XWayland under a Wayland session)
+    --wayland     Linux: force native Wayland
     --cli RANGE   Headless scan, print results to stdout
     --update-oui  Download the latest IEEE MAC-vendor list (needs curl)
                   RANGE: 192.168.1.0/24 | 10.0.0.5-40 | 10.0.0.5-10.0.1.9
@@ -39,6 +48,10 @@ enum Mode {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.is_empty() {
+        // So --cli/--help/errors print when started from cmd/PowerShell.
+        attach_parent_console();
+    }
     let mut mode = Mode::Fullscreen;
     let mut autoscan = false;
     let mut i = 0;
@@ -47,6 +60,14 @@ fn main() {
             "--kiosk" => mode = Mode::Kiosk,
             "--windowed" => mode = Mode::Windowed,
             "--scan" => autoscan = true,
+            // gpui picks Wayland when WAYLAND_DISPLAY is set, X11 otherwise.
+            "--x11" => unsafe { std::env::remove_var("WAYLAND_DISPLAY") },
+            "--wayland" => {
+                if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+                    eprintln!("--wayland: WAYLAND_DISPLAY is not set (not a Wayland session)");
+                    std::process::exit(2);
+                }
+            }
             "--cli" => return run_cli(args.get(i + 1).cloned()),
             "--update-oui" => {
                 return match netinfo::update_oui_db() {
@@ -72,16 +93,16 @@ fn run_gui(mode: Mode, autoscan: bool) {
     let kiosk = mode == Mode::Kiosk;
     Application::new().run(move |cx: &mut App| {
         cx.bind_keys([
-            KeyBinding::new("ctrl-q", Quit, None),
+            KeyBinding::new("secondary-q", Quit, None),
             KeyBinding::new("f5", StartStop, Some("Scanner")),
-            KeyBinding::new("ctrl-r", StartStop, Some("Scanner")),
+            KeyBinding::new("secondary-r", StartStop, Some("Scanner")),
             KeyBinding::new("f6", ToggleFilter, Some("Scanner")),
-            KeyBinding::new("ctrl-e", Export, Some("Scanner")),
+            KeyBinding::new("secondary-e", Export, Some("Scanner")),
             KeyBinding::new("f11", ToggleFullscreen, Some("Scanner")),
             KeyBinding::new("escape", RequestQuit, Some("Scanner")),
             KeyBinding::new("escape", CancelDialog, Some("QuitDialog")),
             KeyBinding::new("enter", Quit, Some("QuitDialog")),
-            KeyBinding::new("ctrl-f", FocusSearch, Some("Scanner")),
+            KeyBinding::new("secondary-f", FocusSearch, Some("Scanner")),
             KeyBinding::new("escape", ClearSearch, Some("SearchBox")),
         ]);
         // Fallback so Ctrl+Q works even if nothing in the window has focus.
@@ -99,7 +120,9 @@ fn run_gui(mode: Mode, autoscan: bool) {
             .map(|d| d.bounds())
             .unwrap_or_else(|| Bounds::new(point(px(0.), px(0.)), size(px(1920.), px(1080.))));
         let window_bounds = match mode {
-            Mode::Windowed => WindowBounds::Windowed(Bounds::centered(None, size(px(1400.), px(860.)), cx)),
+            Mode::Windowed => {
+                WindowBounds::Windowed(Bounds::centered(None, size(px(1400.), px(860.)), cx))
+            }
             _ => WindowBounds::Maximized(display_bounds),
         };
 
@@ -140,7 +163,9 @@ fn run_gui(mode: Mode, autoscan: bool) {
             // Linux backends ignore an initial Fullscreen bound, so request it
             // once the window has been mapped by the compositor/WM.
             cx.spawn(async move |cx| {
-                cx.background_executor().timer(Duration::from_millis(250)).await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
                 window
                     .update(cx, |_, window, _| {
                         if !window.is_fullscreen() {
@@ -157,10 +182,12 @@ fn run_gui(mode: Mode, autoscan: bool) {
 
 fn run_cli(range: Option<String>) {
     let iface = netinfo::local_interfaces().into_iter().next();
-    let range = range.or_else(|| iface.as_ref().map(|i| i.cidr())).unwrap_or_else(|| {
-        eprintln!("no interface found; pass a range");
-        std::process::exit(2)
-    });
+    let range = range
+        .or_else(|| iface.as_ref().map(|i| i.cidr()))
+        .unwrap_or_else(|| {
+            eprintln!("no interface found; pass a range");
+            std::process::exit(2)
+        });
     let targets = netinfo::parse_range(&range).unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(2)
@@ -177,7 +204,9 @@ fn run_cli(range: Option<String>) {
     while let Ok(ev) = handle.events.recv() {
         match ev {
             scanner::ScanEvent::Host(i, h) => hosts[i] = Some(*h),
-            scanner::ScanEvent::Intercepted(p) => eprintln!("warning: ports {p:?} are intercepted by a local proxy; excluded"),
+            scanner::ScanEvent::Intercepted(p) => {
+                eprintln!("warning: ports {p:?} are intercepted by a local proxy; excluded")
+            }
             scanner::ScanEvent::Finished { elapsed, .. } => {
                 let alive: Vec<_> = hosts.iter().flatten().filter(|h| h.is_alive()).collect();
                 for h in &alive {
@@ -188,7 +217,12 @@ fn run_cli(range: Option<String>) {
                         h.ttl.map(|t| t.to_string()).unwrap_or("-".into()),
                         h.hostname().unwrap_or("-".into()),
                         h.mac.clone().unwrap_or("-".into()),
-                        h.vendor.clone().unwrap_or("-".into()).chars().take(28).collect::<String>(),
+                        h.vendor
+                            .clone()
+                            .unwrap_or("-".into())
+                            .chars()
+                            .take(28)
+                            .collect::<String>(),
                         h.device_type.clone().unwrap_or("-".into()),
                         h.os_guess.clone().unwrap_or("-".into()),
                         h.ports_summary(),
@@ -202,12 +236,36 @@ fn run_cli(range: Option<String>) {
                         println!("{:<16}   http title: {t}", "");
                     }
                     if let Some(u) = &h.upnp {
-                        println!("{:<16}   upnp: {:?} {:?} {:?} {:?}", "", u.friendly_name, u.manufacturer, u.model, u.server);
+                        println!(
+                            "{:<16}   upnp: {:?} {:?} {:?} {:?}",
+                            "", u.friendly_name, u.manufacturer, u.model, u.server
+                        );
                     }
                 }
-                eprintln!("{} live hosts in {:.1}s", alive.len(), elapsed.as_secs_f32());
+                eprintln!(
+                    "{} live hosts in {:.1}s",
+                    alive.len(),
+                    elapsed.as_secs_f32()
+                );
                 break;
             }
         }
     }
 }
+
+/// The Windows build uses the GUI subsystem (no console window), so CLI
+/// output has to attach to the console of the shell that started us.
+#[cfg(windows)]
+fn attach_parent_console() {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+    }
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+    unsafe {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+#[cfg(not(windows))]
+fn attach_parent_console() {}

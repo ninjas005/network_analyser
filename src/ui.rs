@@ -14,7 +14,17 @@ use crate::scanner::{self, HostInfo, ScanConfig, ScanEvent, ScanHandle, Status};
 
 actions!(
     network_analyser,
-    [Quit, RequestQuit, CancelDialog, ToggleFullscreen, StartStop, ToggleFilter, Export, FocusSearch, ClearSearch]
+    [
+        Quit,
+        RequestQuit,
+        CancelDialog,
+        ToggleFullscreen,
+        StartStop,
+        ToggleFilter,
+        Export,
+        FocusSearch,
+        ClearSearch
+    ]
 );
 
 // ---------------------------------------------------------------- palette
@@ -72,7 +82,10 @@ pub struct ScannerView {
 impl ScannerView {
     pub fn new(kiosk: bool, cx: &mut Context<Self>) -> Self {
         let iface = netinfo::local_interfaces().into_iter().next();
-        let range_input = iface.as_ref().map(|i| i.cidr()).unwrap_or_else(|| "192.168.1.0/24".into());
+        let range_input = iface
+            .as_ref()
+            .map(|i| i.cidr())
+            .unwrap_or_else(|| "192.168.1.0/24".into());
         let status_msg = match &iface {
             Some(i) => format!("Interface {} — {} / {}", i.name, i.ip, i.prefix),
             None => "No IPv4 interface detected".into(),
@@ -137,7 +150,11 @@ impl ScannerView {
         self.intercepted.clear();
         self.recompute_visible();
         let local = netinfo::local_interfaces();
-        let iface = local.iter().find(|i| targets.contains(&i.ip)).cloned().or(self.iface.clone());
+        let iface = local
+            .iter()
+            .find(|i| targets.contains(&i.ip))
+            .cloned()
+            .or(self.iface.clone());
         let n = targets.len();
         self.scan = Some(scanner::start(ScanConfig {
             targets,
@@ -151,7 +168,9 @@ impl ScannerView {
         self.status_msg = format!("Scanning {n} addresses…").into();
         self._poll = Some(cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor().timer(Duration::from_millis(120)).await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(120))
+                    .await;
                 match this.update(cx, |this, cx| this.drain_events(cx)) {
                     Ok(true) => {}
                     _ => break,
@@ -184,7 +203,11 @@ impl ScannerView {
             let alive = self.hosts.iter().filter(|h| h.is_alive()).count();
             self.status_msg = format!(
                 "{} — {alive} live hosts of {} in {:.1}s",
-                if cancelled { "Scan stopped" } else { "Scan complete" },
+                if cancelled {
+                    "Scan stopped"
+                } else {
+                    "Scan complete"
+                },
                 self.hosts.len(),
                 elapsed.as_secs_f32()
             )
@@ -236,12 +259,21 @@ impl ScannerView {
     }
 
     fn toggle_filter(&mut self, _: &ToggleFilter, _: &mut Window, cx: &mut Context<Self>) {
-        self.filter = if self.filter == Filter::Alive { Filter::All } else { Filter::Alive };
+        self.filter = if self.filter == Filter::Alive {
+            Filter::All
+        } else {
+            Filter::Alive
+        };
         self.recompute_visible();
         cx.notify();
     }
 
-    fn toggle_fullscreen(&mut self, _: &ToggleFullscreen, window: &mut Window, _: &mut Context<Self>) {
+    fn toggle_fullscreen(
+        &mut self,
+        _: &ToggleFullscreen,
+        window: &mut Window,
+        _: &mut Context<Self>,
+    ) {
         // In kiosk mode the window must stay fullscreen.
         if !self.kiosk {
             window.toggle_fullscreen();
@@ -274,12 +306,15 @@ impl ScannerView {
     }
 
     fn export_csv(&self) -> std::io::Result<String> {
-        let dir = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let dir = crate::platform::home_dir()
+            .map(|d| d.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".into());
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let path = format!("{dir}/network-scan-{ts}.csv");
+        let path = std::path::Path::new(&dir).join(format!("network-scan-{ts}.csv"));
+        let path = path.to_string_lossy().into_owned();
         let q = |s: Option<&str>| format!("\"{}\"", s.unwrap_or("").replace('"', "\"\""));
         let mut out = String::from(
             "ip,status,ping_ms,ttl,hostname,dns,mdns,netbios,workgroup,mac,vendor,device,os,open_ports,http_title,http_server,upnp_name,upnp_model\n",
@@ -287,27 +322,29 @@ impl ScannerView {
         for h in self.hosts.iter().filter(|h| h.is_alive()) {
             let nb = h.netbios.as_ref();
             let up = h.upnp.as_ref();
-            out.push_str(&[
-                h.ip.to_string(),
-                "alive".into(),
-                h.rtt_ms.map(|r| format!("{r:.1}")).unwrap_or_default(),
-                h.ttl.map(|t| t.to_string()).unwrap_or_default(),
-                q(h.hostname().as_deref()),
-                q(h.dns_name.as_deref()),
-                q(h.mdns_name.as_deref()),
-                q(nb.and_then(|n| n.name.as_deref())),
-                q(nb.and_then(|n| n.group.as_deref())),
-                q(h.mac.as_deref()),
-                q(h.vendor.as_deref()),
-                q(h.device_type.as_deref()),
-                q(h.os_guess.as_deref()),
-                q(Some(&h.ports_summary())),
-                q(h.http_title.as_deref()),
-                q(h.http_server.as_deref()),
-                q(up.and_then(|u| u.friendly_name.as_deref())),
-                q(up.and_then(|u| u.model.as_deref())),
-            ]
-            .join(","));
+            out.push_str(
+                &[
+                    h.ip.to_string(),
+                    "alive".into(),
+                    h.rtt_ms.map(|r| format!("{r:.1}")).unwrap_or_default(),
+                    h.ttl.map(|t| t.to_string()).unwrap_or_default(),
+                    q(h.hostname().as_deref()),
+                    q(h.dns_name.as_deref()),
+                    q(h.mdns_name.as_deref()),
+                    q(nb.and_then(|n| n.name.as_deref())),
+                    q(nb.and_then(|n| n.group.as_deref())),
+                    q(h.mac.as_deref()),
+                    q(h.vendor.as_deref()),
+                    q(h.device_type.as_deref()),
+                    q(h.os_guess.as_deref()),
+                    q(Some(&h.ports_summary())),
+                    q(h.http_title.as_deref()),
+                    q(h.http_server.as_deref()),
+                    q(up.and_then(|u| u.friendly_name.as_deref())),
+                    q(up.and_then(|u| u.model.as_deref())),
+                ]
+                .join(","),
+            );
             out.push('\n');
         }
         std::fs::write(&path, out)?;
@@ -353,7 +390,9 @@ impl ScannerView {
             }
             "enter" | "tab" => return,
             _ => match ks.key_char.as_deref() {
-                Some(c) if !c.chars().any(char::is_control) && self.search.len() < 60 => self.search.push_str(c),
+                Some(c) if !c.chars().any(char::is_control) && self.search.len() < 60 => {
+                    self.search.push_str(c)
+                }
                 _ => return,
             },
         }
@@ -410,10 +449,19 @@ impl ScannerView {
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .when(empty && !focused, |d| {
-                        d.text_color(rgb(C::MUTED)).child("Search hosts (Ctrl+F)")
+                        d.text_color(rgb(C::MUTED))
+                            .child(if cfg!(target_os = "macos") {
+                                "Search hosts (⌘F)"
+                            } else {
+                                "Search hosts (Ctrl+F)"
+                            })
                     })
-                    .when(!empty, |d| d.text_color(rgb(C::TEXT)).child(self.search.clone()))
-                    .when(focused, |d| d.child(div().w(px(1.5)).h(px(16.)).ml(px(1.)).bg(rgb(C::ACCENT)))),
+                    .when(!empty, |d| {
+                        d.text_color(rgb(C::TEXT)).child(self.search.clone())
+                    })
+                    .when(focused, |d| {
+                        d.child(div().w(px(1.5)).h(px(16.)).ml(px(1.)).bg(rgb(C::ACCENT)))
+                    }),
             )
             .when(!empty, |d| {
                 d.child(
@@ -494,7 +542,9 @@ impl ScannerView {
             .text_sm()
             .text_color(rgb(C::TEXT))
             .child(self.range_input.clone())
-            .when(focused, |d| d.child(div().w(px(1.5)).h(px(16.)).ml(px(1.)).bg(rgb(C::ACCENT))));
+            .when(focused, |d| {
+                d.child(div().w(px(1.5)).h(px(16.)).ml(px(1.)).bg(rgb(C::ACCENT)))
+            });
 
         let iface_btn = self.iface.as_ref().map(|i| {
             let cidr = i.cidr();
@@ -528,32 +578,73 @@ impl ScannerView {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(div().size(px(12.)).rounded_full().bg(rgb(if scanning { C::AMBER } else { C::GREEN })))
-                    .child(div().text_lg().font_weight(gpui::FontWeight::BOLD).child("Network Analyser")),
+                    .child(div().size(px(12.)).rounded_full().bg(rgb(if scanning {
+                        C::AMBER
+                    } else {
+                        C::GREEN
+                    })))
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child("Network Analyser"),
+                    ),
             )
             .child(div().w(px(16.)))
             .child(div().text_sm().text_color(rgb(C::MUTED)).child("Range"))
             .child(input)
             .children(iface_btn)
             .child(if scanning {
-                Self::button("start", "■ Stop", C::AMBER, C::AMBER, act(|t, w, cx| t.start_stop(&StartStop, w, cx)))
-                    .into_any_element()
+                Self::button(
+                    "start",
+                    "■ Stop",
+                    C::AMBER,
+                    C::AMBER,
+                    act(|t, w, cx| t.start_stop(&StartStop, w, cx)),
+                )
+                .into_any_element()
             } else {
-                Self::button("start", "▶ Scan", C::ACCENT, C::ACCENT_HOVER, act(|t, w, cx| t.start_stop(&StartStop, w, cx)))
-                    .into_any_element()
+                Self::button(
+                    "start",
+                    "▶ Scan",
+                    C::ACCENT,
+                    C::ACCENT_HOVER,
+                    act(|t, w, cx| t.start_stop(&StartStop, w, cx)),
+                )
+                .into_any_element()
             })
-            .children(self.range_error.clone().map(|e| div().text_sm().text_color(rgb(C::RED)).child(e)))
+            .children(
+                self.range_error
+                    .clone()
+                    .map(|e| div().text_sm().text_color(rgb(C::RED)).child(e)),
+            )
             .child(div().flex_1())
             .child(self.render_search(window, cx))
             .child(Self::button(
                 "filter",
-                if self.filter == Filter::Alive { "Showing: live hosts" } else { "Showing: all addresses" },
+                if self.filter == Filter::Alive {
+                    "Showing: live hosts"
+                } else {
+                    "Showing: all addresses"
+                },
                 C::PANEL2,
                 C::BORDER,
                 act(|t, w, cx| t.toggle_filter(&ToggleFilter, w, cx)),
             ))
-            .child(Self::button("export", "Export CSV", C::PANEL2, C::BORDER, act(|t, w, cx| t.export(&Export, w, cx))))
-            .child(Self::button("quit", "✕ Quit", C::RED, C::RED_HOVER, act(|t, w, cx| t.request_quit(&RequestQuit, w, cx))))
+            .child(Self::button(
+                "export",
+                "Export CSV",
+                C::PANEL2,
+                C::BORDER,
+                act(|t, w, cx| t.export(&Export, w, cx)),
+            ))
+            .child(Self::button(
+                "quit",
+                "✕ Quit",
+                C::RED,
+                C::RED_HOVER,
+                act(|t, w, cx| t.request_quit(&RequestQuit, w, cx)),
+            ))
     }
 
     fn render_table(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -571,7 +662,13 @@ impl ScannerView {
             .text_color(rgb(C::MUTED))
             .children(COLUMNS.iter().enumerate().map(|(i, (name, w))| {
                 let arrow = match self.sort {
-                    Some((c, desc)) if c == i => if desc { " ▼" } else { " ▲" },
+                    Some((c, desc)) if c == i => {
+                        if desc {
+                            " ▼"
+                        } else {
+                            " ▲"
+                        }
+                    }
                     _ => "",
                 };
                 let active = !arrow.is_empty();
@@ -631,7 +728,14 @@ impl ScannerView {
             .into_any_element()
         };
 
-        div().flex().flex_col().flex_1().h_full().min_w_0().child(header).child(body)
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .h_full()
+            .min_w_0()
+            .child(header)
+            .child(body)
     }
 
     fn render_row(&self, vi: usize, idx: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -639,7 +743,8 @@ impl ScannerView {
         let selected = self.selected == Some(idx);
         let (dot, _) = status_color(h.status);
         let muted = !h.is_alive();
-        let text = |s: Option<String>| s.unwrap_or_else(|| if muted { String::new() } else { "—".into() });
+        let text =
+            |s: Option<String>| s.unwrap_or_else(|| if muted { String::new() } else { "—".into() });
         let mut ip = h.ip.to_string();
         if h.is_gateway {
             ip.push_str("  (gw)");
@@ -655,7 +760,11 @@ impl ScannerView {
             text(h.vendor.clone()),
             text(h.device_type.clone()),
             text(h.os_guess.clone()),
-            if h.ports.is_empty() { text(None) } else { h.ports_summary() },
+            if h.ports.is_empty() {
+                text(None)
+            } else {
+                h.ports_summary()
+            },
         ];
         div()
             .id(("row", idx))
@@ -677,7 +786,11 @@ impl ScannerView {
             .hover(|s| s.bg(rgb(C::PANEL2)))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.selected = if this.selected == Some(idx) { None } else { Some(idx) };
+                this.selected = if this.selected == Some(idx) {
+                    None
+                } else {
+                    Some(idx)
+                };
                 cx.notify();
             }))
             .child(
@@ -686,7 +799,12 @@ impl ScannerView {
                     .flex_none()
                     .child(div().size(px(9.)).rounded_full().bg(dot)),
             )
-            .children(COLUMNS[1..].iter().zip(values).map(|((_, w), v)| cell(*w, v)))
+            .children(
+                COLUMNS[1..]
+                    .iter()
+                    .zip(values)
+                    .map(|((_, w), v)| cell(*w, v)),
+            )
             .into_any_element()
     }
 
@@ -735,22 +853,38 @@ impl ScannerView {
         }
         sections.push(("Web / UPnP", web));
 
-        let ports = h.ports.iter().map(|p| {
-            div()
-                .flex()
-                .flex_col()
-                .py_1()
-                .border_b_1()
-                .border_color(rgb(C::BORDER))
-                .child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .child(div().w(px(60.)).text_color(rgb(C::GREEN)).child(format!("{}/tcp", p.port)))
-                        .child(div().text_color(rgb(C::MUTED)).child(if p.service.is_empty() { "unknown" } else { p.service })),
-                )
-                .children(p.banner.clone().map(|b| div().text_xs().text_color(rgb(C::MUTED)).child(b)))
-        });
+        let ports =
+            h.ports.iter().map(|p| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(rgb(C::BORDER))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(60.))
+                                    .text_color(rgb(C::GREEN))
+                                    .child(format!("{}/tcp", p.port)),
+                            )
+                            .child(div().text_color(rgb(C::MUTED)).child(
+                                if p.service.is_empty() {
+                                    "unknown"
+                                } else {
+                                    p.service
+                                },
+                            )),
+                    )
+                    .children(
+                        p.banner
+                            .clone()
+                            .map(|b| div().text_xs().text_color(rgb(C::MUTED)).child(b)),
+                    )
+            });
 
         div()
             .id("details")
@@ -775,8 +909,17 @@ impl ScannerView {
                         div()
                             .flex()
                             .flex_col()
-                            .child(div().text_xl().font_weight(gpui::FontWeight::BOLD).child(h.ip.to_string()))
-                            .child(div().text_color(rgb(C::MUTED)).child(h.hostname().unwrap_or_else(|| "unknown host".into()))),
+                            .child(
+                                div()
+                                    .text_xl()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .child(h.ip.to_string()),
+                            )
+                            .child(
+                                div()
+                                    .text_color(rgb(C::MUTED))
+                                    .child(h.hostname().unwrap_or_else(|| "unknown host".into())),
+                            ),
                     )
                     .child(
                         div()
@@ -793,20 +936,31 @@ impl ScannerView {
                             })),
                     ),
             )
-            .children(sections.into_iter().filter(|(_, v)| !v.is_empty()).map(|(title, pairs)| {
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(section_title(title))
-                    .children(pairs.into_iter().map(|(k, v)| {
+            .children(
+                sections
+                    .into_iter()
+                    .filter(|(_, v)| !v.is_empty())
+                    .map(|(title, pairs)| {
                         div()
                             .flex()
-                            .gap_2()
-                            .child(div().w(px(120.)).flex_none().text_color(rgb(C::MUTED)).child(k))
-                            .child(div().flex_1().min_w_0().child(v))
-                    }))
-            }))
+                            .flex_col()
+                            .gap_1()
+                            .child(section_title(title))
+                            .children(pairs.into_iter().map(|(k, v)| {
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .w(px(120.))
+                                            .flex_none()
+                                            .text_color(rgb(C::MUTED))
+                                            .child(k),
+                                    )
+                                    .child(div().flex_1().min_w_0().child(v))
+                            }))
+                    }),
+            )
             .child(
                 div()
                     .flex()
@@ -814,26 +968,44 @@ impl ScannerView {
                     .child(section_title(&format!("Open ports ({})", h.ports.len())))
                     .children(ports)
                     .when(h.ports.is_empty(), |d| {
-                        d.child(div().text_color(rgb(C::MUTED)).child(if h.status == Status::Done {
-                            "No open ports among the probed set"
-                        } else {
-                            "Scanning…"
-                        }))
+                        d.child(div().text_color(rgb(C::MUTED)).child(
+                            if h.status == Status::Done {
+                                "No open ports among the probed set"
+                            } else {
+                                "Scanning…"
+                            },
+                        ))
                     }),
             )
     }
 
     fn render_status_bar(&self) -> impl IntoElement {
         let total = self.hosts.len();
-        let done = self.hosts.iter().filter(|h| matches!(h.status, Status::Dead | Status::Done)).count();
+        let done = self
+            .hosts
+            .iter()
+            .filter(|h| matches!(h.status, Status::Dead | Status::Done))
+            .count();
         let alive = self.hosts.iter().filter(|h| h.is_alive()).count();
         let open: usize = self.hosts.iter().map(|h| h.ports.len()).sum();
-        let frac = if total == 0 { 0.0 } else { done as f32 / total as f32 };
+        let frac = if total == 0 {
+            0.0
+        } else {
+            done as f32 / total as f32
+        };
         let elapsed = self.scan_started.map(|s| s.elapsed()).or(self.last_elapsed);
         let keys = if self.kiosk {
-            "F5 scan · Ctrl+F search · F6 filter · Esc / Ctrl+Q quit"
+            if cfg!(target_os = "macos") {
+                "F5 scan · ⌘F search · F6 filter · Esc / ⌘Q quit"
+            } else {
+                "F5 scan · Ctrl+F search · F6 filter · Esc / Ctrl+Q quit"
+            }
         } else {
-            "F5 scan · Ctrl+F search · F6 filter · F11 fullscreen · Esc / Ctrl+Q quit"
+            if cfg!(target_os = "macos") {
+                "F5 scan · ⌘F search · F6 filter · F11 fullscreen · Esc / ⌘Q quit"
+            } else {
+                "F5 scan · Ctrl+F search · F6 filter · F11 fullscreen · Esc / Ctrl+Q quit"
+            }
         };
         div()
             .flex()
@@ -890,12 +1062,20 @@ impl ScannerView {
             .flex()
             .items_center()
             .justify_center()
-            .bg(Hsla::from(Rgba { r: 0., g: 0., b: 0., a: 0.6 }))
-            .occlude()
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                this.confirm_quit = false;
-                cx.notify();
+            .bg(Hsla::from(Rgba {
+                r: 0.,
+                g: 0.,
+                b: 0.,
+                a: 0.6,
             }))
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.confirm_quit = false;
+                    cx.notify();
+                }),
+            )
             .child(
                 div()
                     .id("quit-dialog")
@@ -910,27 +1090,51 @@ impl ScannerView {
                     .border_color(rgb(C::BORDER))
                     .shadow_lg()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(div().text_lg().font_weight(gpui::FontWeight::BOLD).child("Quit Network Analyser?"))
-                    .child(div().text_sm().text_color(rgb(C::MUTED)).child(if self.scanning() {
-                        "A scan is in progress and will be stopped."
-                    } else {
-                        "Any results not exported will be lost."
-                    }))
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child("Quit Network Analyser?"),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(C::MUTED))
+                            .child(if self.scanning() {
+                                "A scan is in progress and will be stopped."
+                            } else {
+                                "Any results not exported will be lost."
+                            }),
+                    )
                     .child(
                         div()
                             .flex()
                             .justify_end()
                             .gap_2()
-                            .child(Self::button("quit-cancel", "Cancel (Esc)", C::PANEL2, C::BORDER, move |_, _, cx| {
-                                view.update(cx, |this, cx| {
-                                    this.confirm_quit = false;
-                                    cx.notify();
-                                })
-                                .ok();
-                            }))
-                            .child(Self::button("quit-confirm", "Quit (Enter)", C::RED, C::RED_HOVER, move |_, window, cx| {
-                                view2.update(cx, |this, cx| this.quit(&Quit, window, cx)).ok();
-                            })),
+                            .child(Self::button(
+                                "quit-cancel",
+                                "Cancel (Esc)",
+                                C::PANEL2,
+                                C::BORDER,
+                                move |_, _, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.confirm_quit = false;
+                                        cx.notify();
+                                    })
+                                    .ok();
+                                },
+                            ))
+                            .child(Self::button(
+                                "quit-confirm",
+                                "Quit (Enter)",
+                                C::RED,
+                                C::RED_HOVER,
+                                move |_, window, cx| {
+                                    view2
+                                        .update(cx, |this, cx| this.quit(&Quit, window, cx))
+                                        .ok();
+                                },
+                            )),
                     ),
             )
     }
@@ -960,7 +1164,11 @@ fn cell(w: f32, text: impl Into<SharedString>) -> gpui::Div {
     }
     let max = ((w - 14.) / 7.4).max(3.) as usize;
     let text: SharedString = if text.chars().count() > max {
-        format!("{}…", text.chars().take(max - 1).collect::<String>().trim_end()).into()
+        format!(
+            "{}…",
+            text.chars().take(max - 1).collect::<String>().trim_end()
+        )
+        .into()
     } else {
         text
     };
@@ -1011,7 +1219,10 @@ enum SortVal {
 
 /// Sort key for a column (indices match COLUMNS). None = no value.
 fn sort_value(h: &HostInfo, col: usize) -> Option<SortVal> {
-    let text = |s: Option<String>| s.filter(|s| !s.is_empty()).map(|s| SortVal::Text(s.to_lowercase()));
+    let text = |s: Option<String>| {
+        s.filter(|s| !s.is_empty())
+            .map(|s| SortVal::Text(s.to_lowercase()))
+    };
     match col {
         0 => Some(SortVal::Num(match h.status {
             Status::Done | Status::Enriching => 0,
@@ -1027,7 +1238,7 @@ fn sort_value(h: &HostInfo, col: usize) -> Option<SortVal> {
         6 => text(h.vendor.clone()),
         7 => text(h.device_type.clone()),
         8 => text(h.os_guess.clone()),
-        9 => (!h.ports.is_empty()).then(|| SortVal::Num(h.ports.len() as u64)),
+        9 => (!h.ports.is_empty()).then_some(SortVal::Num(h.ports.len() as u64)),
         _ => None,
     }
 }
@@ -1069,7 +1280,11 @@ impl Focusable for ScannerView {
 
 impl Render for ScannerView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let context = if self.confirm_quit { "QuitDialog" } else { "Scanner" };
+        let context = if self.confirm_quit {
+            "QuitDialog"
+        } else {
+            "Scanner"
+        };
         div()
             .key_context(context)
             .track_focus(&self.focus)
@@ -1129,7 +1344,11 @@ mod tests {
         let mut h = HostInfo::new("192.168.1.20".parse().unwrap());
         h.vendor = Some("Raspberry Pi Trading Ltd".into());
         h.mdns_name = Some("pihole.local".into());
-        h.ports.push(PortInfo { port: 22, service: "ssh", banner: Some("SSH-2.0-OpenSSH_10.0p2 Debian".into()) });
+        h.ports.push(PortInfo {
+            port: 22,
+            service: "ssh",
+            banner: Some("SSH-2.0-OpenSSH_10.0p2 Debian".into()),
+        });
         assert!(matches_search(&h, ""));
         assert!(matches_search(&h, "RASPBERRY"));
         assert!(matches_search(&h, "raspberry 22"));

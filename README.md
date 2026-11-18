@@ -21,12 +21,53 @@ TEST-NET addresses (RFC 5737). If ports "open" there, a transparent proxy or sec
 agent is answering for every address. Those ports are excluded and a warning appears in
 the status bar.
 
-## Build
+## Install
+
+Download from [Releases](../../releases):
+
+| Platform | Package |
+|---|---|
+| Debian / Ubuntu | `network-analyser_<ver>_amd64.deb` → `sudo apt install ./network-analyser_*.deb` |
+| Fedora / RHEL / openSUSE | `network-analyser-<ver>-1.x86_64.rpm` → `sudo dnf install ./network-analyser-*.rpm` |
+| Other Linux (glibc 2.35+) | `network-analyser-<ver>-linux-x86_64.tar.gz` |
+| macOS 11+ (Apple Silicon + Intel) | `network-analyser-<ver>-macos-universal.dmg` |
+| Windows 10/11 x64 | `network-analyser-<ver>-windows-x86_64.zip` |
+
+**Linux display servers:** one binary supports both **Wayland** and **X11**. It uses
+Wayland when `WAYLAND_DISPLAY` is set and X11 otherwise. `--x11` forces X11 (XWayland
+under a Wayland session) and `--wayland` forces native Wayland. A Vulkan driver is
+required (Mesa's `mesa-vulkan-drivers` covers Intel/AMD and software rendering).
+
+**macOS:** the app is ad-hoc signed but not notarized. On first launch, right-click → Open
+(or `xattr -dr com.apple.quarantine "/Applications/Network Analyser.app"`), then allow
+*Local Network* access.
+
+**Windows:** unsigned, so SmartScreen may warn: click *More info → Run anyway*.
+`--cli` output appears in the console it was started from.
+
+## Build from source
 
 ```sh
-sudo apt install libxkbcommon-x11-dev libxcb1-dev libfontconfig-dev libvulkan-dev   # Debian/Ubuntu
+# Debian/Ubuntu build dependencies (same list CI uses)
+./.github/linux-deps.sh
 cargo build --release
 ```
+
+macOS needs Xcode command-line tools; Windows needs the MSVC toolchain.
+
+## Releasing
+
+CI (`.github/workflows/ci.yml`) runs fmt, clippy and tests on Linux, macOS and Windows
+for every push and PR. To publish a release:
+
+```sh
+# bump `version` in Cargo.toml first, commit, then:
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+`.github/workflows/release.yml` fetches the IEEE MAC-vendor list, builds the
+`.deb`/`.rpm`/`.tar.gz`, a universal macOS `.dmg` and a Windows `.zip`, and publishes them
+with `SHA256SUMS.txt` as a GitHub Release. The tag must match the Cargo.toml version.
 
 ## Run
 
@@ -51,7 +92,7 @@ Ranges: `192.168.1.0/24` (/16–/32), `10.0.0.5-40`, `10.0.0.5-10.0.1.9`, or a s
 | Ctrl+E | Export CSV to `~/network-scan-<timestamp>.csv` |
 | F11 | Toggle fullscreen (not in kiosk) |
 | Esc | Quit dialog (Enter = quit, Esc = cancel) |
-| Ctrl+Q | Quit immediately |
+| Ctrl+Q (⌘Q on macOS) | Quit immediately |
 | ✕ Quit button | Quit dialog |
 
 Click a row to open the details panel. Click a column header to sort (ascending →
@@ -67,8 +108,15 @@ match, so `raspberry 22` finds Raspberry Pis with SSH open.
 - `src/ui.rs` – GPUI view (toolbar, table, details, status bar, quit dialog)
 - `src/scanner.rs` – scan engine (own thread + tokio), fingerprinting
 - `src/probes.rs` – ping, TCP, banners/HTTP, mDNS, NetBIOS, SSDP/UPnP, rDNS
-- `src/netinfo.rs` – interfaces, gateway, ARP, OUI vendors, ranges, port names
+- `src/netinfo.rs` – interfaces, OUI vendors, ranges, port names
+- `src/platform.rs` – per-OS gateway / ARP / MAC / directories (Linux `/proc`, macOS & Windows `route`/`arp`/`ifconfig`/`ipconfig`)
+- `build.rs` – embeds the icon into the Windows `.exe`
+- `assets/` – icon (PNG/ICO), `.desktop` file
 
 `libc` is pinned to 0.2.186 (and tokio to 1.52) in `Cargo.lock`. Newer `libc` removed
 `ENOATTR`, which breaks `xattr 0.2.3`, a dependency gpui 0.2.2 pulls in. Keep the
-lockfile when updating.
+lockfile when updating (CI builds with `--locked`).
+
+## License
+
+MIT, see [LICENSE](LICENSE).

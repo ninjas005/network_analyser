@@ -3,9 +3,9 @@
 
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
@@ -93,7 +93,11 @@ impl HostInfo {
     }
 
     pub fn ports_summary(&self) -> String {
-        self.ports.iter().map(|p| p.port.to_string()).collect::<Vec<_>>().join(", ")
+        self.ports
+            .iter()
+            .map(|p| p.port.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -111,7 +115,10 @@ pub enum ScanEvent {
     /// They are excluded from liveness checks and port results.
     Intercepted(Vec<u16>),
     Host(usize, Box<HostInfo>),
-    Finished { elapsed: Duration, cancelled: bool },
+    Finished {
+        elapsed: Duration,
+        cancelled: bool,
+    },
 }
 
 pub struct ScanHandle {
@@ -126,7 +133,9 @@ impl ScanHandle {
 }
 
 /// Ports used for the fast liveness check (any answer, even RST, = alive).
-const DISCOVERY_PORTS: &[u16] = &[22, 53, 80, 135, 139, 443, 445, 554, 3389, 5000, 7000, 8008, 8080, 9100, 62078];
+const DISCOVERY_PORTS: &[u16] = &[
+    22, 53, 80, 135, 139, 443, 445, 554, 3389, 5000, 7000, 8008, 8080, 9100, 62078,
+];
 
 pub fn start(cfg: ScanConfig) -> ScanHandle {
     let (tx, rx) = channel();
@@ -153,7 +162,9 @@ async fn run(cfg: ScanConfig, tx: Sender<ScanEvent>, cancel: Arc<AtomicBool>) {
     let started = Instant::now();
     let intercepted = detect_interception(&cfg.ports, cfg.connect_timeout).await;
     if !intercepted.is_empty() {
-        let _ = tx.send(ScanEvent::Intercepted(intercepted.iter().copied().collect()));
+        let _ = tx.send(ScanEvent::Intercepted(
+            intercepted.iter().copied().collect(),
+        ));
     }
     let ctx = Arc::new(Ctx {
         intercepted,
@@ -165,11 +176,13 @@ async fn run(cfg: ScanConfig, tx: Sender<ScanEvent>, cancel: Arc<AtomicBool>) {
         connect_timeout: cfg.connect_timeout,
         tx: tx.clone(),
     });
-    let work = futures::stream::iter(cfg.targets.iter().copied().enumerate())
-        .for_each_concurrent(cfg.host_concurrency, |(idx, ip)| {
+    let work = futures::stream::iter(cfg.targets.iter().copied().enumerate()).for_each_concurrent(
+        cfg.host_concurrency,
+        |(idx, ip)| {
             let ctx = ctx.clone();
             async move { scan_host(idx, ip, &ctx).await }
-        });
+        },
+    );
     let watch = async {
         while !cancel.load(Ordering::Relaxed) {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -179,7 +192,10 @@ async fn run(cfg: ScanConfig, tx: Sender<ScanEvent>, cancel: Arc<AtomicBool>) {
         _ = work => false,
         _ = watch => true,
     };
-    let _ = tx.send(ScanEvent::Finished { elapsed: started.elapsed(), cancelled });
+    let _ = tx.send(ScanEvent::Finished {
+        elapsed: started.elapsed(),
+        cancelled,
+    });
 }
 
 struct Ctx {
@@ -234,7 +250,11 @@ async fn scan_host(idx: usize, ip: Ipv4Addr, ctx: &Ctx) {
 
     // ---- phase 1: liveness (ICMP + TCP in parallel, then ARP)
     let ping = probes::ping(ip, Duration::from_secs(1));
-    let tcp = join_all(DISCOVERY_PORTS.iter().map(|&p| async move { (p, ctx.probe(ip, p).await) }));
+    let tcp = join_all(
+        DISCOVERY_PORTS
+            .iter()
+            .map(|&p| async move { (p, ctx.probe(ip, p).await) }),
+    );
     let (ping, tcp) = futures::join!(ping, tcp);
 
     let mut open: BTreeSet<u16> = BTreeSet::new();
@@ -279,8 +299,16 @@ async fn scan_host(idx: usize, ip: Ipv4Addr, ctx: &Ctx) {
     ctx.send(idx, &h);
 
     // ---- phase 2: names + remaining ports, concurrently
-    let rest: Vec<u16> = ctx.ports.iter().copied().filter(|p| !DISCOVERY_PORTS.contains(p)).collect();
-    let port_scan = join_all(rest.iter().map(|&p| async move { (p, ctx.probe(ip, p).await) }));
+    let rest: Vec<u16> = ctx
+        .ports
+        .iter()
+        .copied()
+        .filter(|p| !DISCOVERY_PORTS.contains(p))
+        .collect();
+    let port_scan = join_all(
+        rest.iter()
+            .map(|&p| async move { (p, ctx.probe(ip, p).await) }),
+    );
     let (dns, mdns, nb, upnp, more) = futures::join!(
         probes::reverse_dns(ip),
         probes::mdns_name(ip),
@@ -288,7 +316,11 @@ async fn scan_host(idx: usize, ip: Ipv4Addr, ctx: &Ctx) {
         probes::upnp(ip),
         port_scan
     );
-    open.extend(more.into_iter().filter(|(_, s)| matches!(s, TcpState::Open)).map(|(p, _)| p));
+    open.extend(
+        more.into_iter()
+            .filter(|(_, s)| matches!(s, TcpState::Open))
+            .map(|(p, _)| p),
+    );
     h.dns_name = dns;
     h.mdns_name = mdns.map(|n| n.trim_end_matches('.').to_string());
     if h.mac.is_none() {
@@ -298,7 +330,7 @@ async fn scan_host(idx: usize, ip: Ipv4Addr, ctx: &Ctx) {
     h.netbios = nb;
     h.upnp = upnp;
     if h.is_self && h.dns_name.is_none() {
-        h.dns_name = std::fs::read_to_string("/etc/hostname").ok().map(|s| s.trim().to_string());
+        h.dns_name = dns_lookup::get_hostname().ok();
     }
     set_ports(&mut h, &open);
     ctx.send(idx, &h);
@@ -306,7 +338,10 @@ async fn scan_host(idx: usize, ip: Ipv4Addr, ctx: &Ctx) {
     // ---- phase 3: banners / HTTP
     let banners = join_all(open.iter().map(|&p| async move {
         let _permit = ctx.sockets.acquire().await;
-        (p, probes::grab_banner(ip, p, netinfo::is_http_port(p)).await)
+        (
+            p,
+            probes::grab_banner(ip, p, netinfo::is_http_port(p)).await,
+        )
     }))
     .await;
     for (port, b) in banners {
@@ -330,7 +365,11 @@ async fn scan_host(idx: usize, ip: Ipv4Addr, ctx: &Ctx) {
 fn set_ports(h: &mut HostInfo, open: &BTreeSet<u16>) {
     for &p in open {
         if !h.ports.iter().any(|x| x.port == p) {
-            h.ports.push(PortInfo { port: p, service: netinfo::service_name(p), banner: None });
+            h.ports.push(PortInfo {
+                port: p,
+                service: netinfo::service_name(p),
+                banner: None,
+            });
         }
     }
     h.ports.sort_by_key(|p| p.port);
@@ -350,7 +389,11 @@ fn fingerprint(h: &HostInfo) -> (Option<String>, Option<String>) {
         .to_lowercase();
     let vendor = h.vendor.as_deref().unwrap_or("").to_lowercase();
     let mdns = h.mdns_name.as_deref().unwrap_or("").to_lowercase();
-    let upnp_type = h.upnp.as_ref().and_then(|u| u.device_type.clone()).unwrap_or_default();
+    let upnp_type = h
+        .upnp
+        .as_ref()
+        .and_then(|u| u.device_type.clone())
+        .unwrap_or_default();
 
     let mut os: Option<String> = None;
     for (needle, name) in [
@@ -414,9 +457,17 @@ fn fingerprint(h: &HostInfo) -> (Option<String>, Option<String>) {
         Some("Windows PC / Server")
     } else if upnp_type.contains("InternetGatewayDevice") || has(7547) {
         Some("Router / Access point")
-    } else if vendor.contains("espressif") || vendor.contains("tuya") || vendor.contains("shenzhen") {
+    } else if vendor.contains("espressif") || vendor.contains("tuya") || vendor.contains("shenzhen")
+    {
         Some("IoT device")
-    } else if vendor.contains("samsung") || vendor.contains("xiaomi") || vendor.contains("oneplus") || vendor.contains("oppo") || vendor.contains("vivo") || vendor.contains("huawei") || vendor.contains("motorola") {
+    } else if vendor.contains("samsung")
+        || vendor.contains("xiaomi")
+        || vendor.contains("oneplus")
+        || vendor.contains("oppo")
+        || vendor.contains("vivo")
+        || vendor.contains("huawei")
+        || vendor.contains("motorola")
+    {
         Some("Phone / Tablet")
     } else if vendor.contains("raspberry") {
         Some("Raspberry Pi")
