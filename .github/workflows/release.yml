@@ -17,23 +17,36 @@ env:
 
 jobs:
   oui:
-    name: Fetch MAC vendor list
+    name: Refresh MAC vendor list
     runs-on: ubuntu-latest
     steps:
-      - name: Download IEEE OUI registry (compact "PREFIX Vendor" format)
+      - uses: actions/checkout@v4
+      # Output is the compact "PREFIX Vendor" format. IEEE often blocks CI
+      # runners (HTTP 418), so try IEEE, then Wireshark's manuf mirror, and
+      # fall back to the copy committed in assets/oui.txt.
+      - name: Build oui.txt
         run: |
-          set -euo pipefail
-          for i in 1 2 3; do
-            if curl -fsSL --retry 3 -A "Mozilla/5.0" -o oui-full.txt https://standards-oui.ieee.org/oui/oui.txt; then break; fi
-            sleep 10
-          done
-          grep "(base 16)" oui-full.txt \
-            | tr -d '\r' \
-            | sed -E 's/^([0-9A-Fa-f]{6})[[:space:]]+\(base 16\)[[:space:]]+(.*)$/\1 \2/' \
-            | sort -u > oui.txt
-          lines=$(wc -l < oui.txt)
-          echo "OUI entries: $lines"
-          test "$lines" -gt 20000
+          set -uo pipefail
+          min=20000
+          if curl -fsSL --retry 2 -A "Mozilla/5.0" -o ieee.txt https://standards-oui.ieee.org/oui/oui.txt; then
+            grep "(base 16)" ieee.txt | tr -d '\r' \
+              | sed -E 's/^([0-9A-Fa-f]{6})[[:space:]]+\(base 16\)[[:space:]]+(.*)$/\1 \2/' \
+              | sort -u > fresh.txt
+          fi
+          if [ "$(wc -l < fresh.txt 2>/dev/null || echo 0)" -lt $min ] \
+             && curl -fsSL --retry 2 -o manuf.txt https://www.wireshark.org/download/automated/data/manuf; then
+            # "00:00:0C<TAB>Cisco<TAB>Cisco Systems, Inc" (skip /28, /36 blocks)
+            grep -E '^[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}[[:space:]]' manuf.txt \
+              | awk -F'\t' '{p=toupper($1); gsub(/[: \t]/,"",p); v=($3!=""?$3:$2); print p" "v}' \
+              | sort -u > fresh.txt
+          fi
+          n=$(wc -l < fresh.txt 2>/dev/null || echo 0)
+          if [ "$n" -ge $min ]; then
+            cp fresh.txt oui.txt; echo "Using freshly downloaded list ($n entries)"
+          else
+            cp assets/oui.txt oui.txt; echo "::warning::Download failed; using committed assets/oui.txt ($(wc -l < oui.txt) entries)"
+          fi
+          test "$(wc -l < oui.txt)" -ge $min
       - uses: actions/upload-artifact@v4
         with:
           name: oui

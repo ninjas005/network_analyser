@@ -33,7 +33,7 @@ codegen-units = 1
 panic = "abort"
 
 # ---------------------------------------------------------------- packaging
-# Release CI writes assets/oui.txt (IEEE MAC-vendor list) before packaging.
+# assets/oui.txt: IEEE MAC-vendor list; the release workflow refreshes it when it can.
 
 [package.metadata.deb]
 name = "network-analyser"
