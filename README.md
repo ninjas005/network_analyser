@@ -29,9 +29,9 @@ Download from [Releases](../../releases):
 |---|---|
 | Debian / Ubuntu | `network-analyser_<ver>_amd64.deb` → `sudo apt install ./network-analyser_*.deb` |
 | Fedora / RHEL / openSUSE | `network-analyser-<ver>-1.x86_64.rpm` → `sudo dnf install ./network-analyser-*.rpm` |
-| Other Linux (glibc 2.35+) | `network-analyser-<ver>-linux-x86_64.tar.gz` |
+| Other Linux (glibc 2.35+) | `network-analyser-<ver>-linux-x86_64.tar.gz` → `./install.sh` (user) or `sudo ./install.sh` |
 | macOS 11+ (Apple Silicon + Intel) | `network-analyser-<ver>-macos-universal.dmg` |
-| Windows 10/11 x64 | `network-analyser-<ver>-windows-x86_64.zip` |
+| Windows 10/11 x64 | `network-analyser-<ver>-windows-x86_64-setup.exe` (installer) or `…-windows-x86_64.zip` (portable) |
 
 **Linux display servers:** one binary supports both **Wayland** and **X11**. It uses
 Wayland when `WAYLAND_DISPLAY` is set and X11 otherwise. `--x11` forces X11 (XWayland
@@ -65,8 +65,9 @@ for every push and PR. To publish a release:
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
-`.github/workflows/release.yml` fetches the IEEE MAC-vendor list, builds the
-`.deb`/`.rpm`/`.tar.gz`, a universal macOS `.dmg` and a Windows `.zip`, and publishes them
+`.github/workflows/release.yml` refreshes the MAC-vendor list, builds the
+`.deb`/`.rpm`/`.tar.gz` (with `install.sh`), a universal macOS `.dmg`, and a Windows
+`setup.exe` (Inno Setup, `packaging/windows/installer.iss`) plus a portable `.zip`, and publishes them
 with `SHA256SUMS.txt` as a GitHub Release. The tag must match the Cargo.toml version.
 
 ## Run
