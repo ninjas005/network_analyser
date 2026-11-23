@@ -10,6 +10,7 @@ pub enum Segment {
     PortsServices,
     PacketAnalysis,
     Industrial,
+    Iot,
     Serial,
     Security,
     Performance,
@@ -17,11 +18,12 @@ pub enum Segment {
 }
 
 impl Segment {
-    pub const ALL: [Segment; 8] = [
+    pub const ALL: [Segment; 9] = [
         Segment::Discovery,
         Segment::PortsServices,
         Segment::PacketAnalysis,
         Segment::Industrial,
+        Segment::Iot,
         Segment::Serial,
         Segment::Security,
         Segment::Performance,
@@ -34,6 +36,7 @@ impl Segment {
             Segment::PortsServices => "Ports & Services",
             Segment::PacketAnalysis => "Packet Analysis",
             Segment::Industrial => "Industrial Protocols",
+            Segment::Iot => "IoT Protocols",
             Segment::Serial => "Serial Communication",
             Segment::Security => "Security & Audit",
             Segment::Performance => "Performance",
@@ -54,8 +57,19 @@ pub enum Tool {
     PortScan,
     ServiceVersions,
     TlsScan,
+    Snmp,
+    Ntp,
+    Sftp,
+    DhcpClient,
+    DnsClient,
     Capture,
     Modbus,
+    CanBus,
+    Profinet,
+    Bacnet,
+    OpcUa,
+    Mqtt,
+    WebSocket,
     Serial,
     PortAudit,
     Firewall,
@@ -78,7 +92,7 @@ pub enum Tool {
 
 impl Tool {
     /// Sidebar order (grouped by segment).
-    pub const ALL: [Tool; 30] = [
+    pub const ALL: [Tool; 41] = [
         Tool::LanScan,
         Tool::Gateway,
         Tool::Traceroute,
@@ -89,8 +103,19 @@ impl Tool {
         Tool::PortScan,
         Tool::ServiceVersions,
         Tool::TlsScan,
+        Tool::Snmp,
+        Tool::Ntp,
+        Tool::Sftp,
+        Tool::DhcpClient,
+        Tool::DnsClient,
         Tool::Capture,
         Tool::Modbus,
+        Tool::CanBus,
+        Tool::Profinet,
+        Tool::Bacnet,
+        Tool::OpcUa,
+        Tool::Mqtt,
+        Tool::WebSocket,
         Tool::Serial,
         Tool::PortAudit,
         Tool::Firewall,
@@ -120,7 +145,14 @@ impl Tool {
             | Tool::ReverseDns
             | Tool::Dhcp
             | Tool::WakeOnLan => Segment::Discovery,
-            Tool::PortScan | Tool::ServiceVersions | Tool::TlsScan => Segment::PortsServices,
+            Tool::PortScan
+            | Tool::ServiceVersions
+            | Tool::TlsScan
+            | Tool::Snmp
+            | Tool::Ntp
+            | Tool::Sftp
+            | Tool::DhcpClient
+            | Tool::DnsClient => Segment::PortsServices,
             Tool::PortAudit
             | Tool::Firewall
             | Tool::RogueDhcp
@@ -135,7 +167,10 @@ impl Tool {
             | Tool::Wifi
             | Tool::Uptime => Segment::Performance,
             Tool::Capture => Segment::PacketAnalysis,
-            Tool::Modbus => Segment::Industrial,
+            Tool::Modbus | Tool::CanBus | Tool::Profinet | Tool::Bacnet | Tool::OpcUa => {
+                Segment::Industrial
+            }
+            Tool::Mqtt | Tool::WebSocket => Segment::Iot,
             Tool::Serial => Segment::Serial,
             Tool::NetConfig | Tool::PublicIp | Tool::GeoIp | Tool::Base64 => Segment::Utilities,
         }
@@ -153,6 +188,17 @@ impl Tool {
             Tool::PortScan => "Port Scan",
             Tool::ServiceVersions => "Service Versions",
             Tool::TlsScan => "TLS Certificates",
+            Tool::Snmp => "SNMP",
+            Tool::Ntp => "NTP Analyser",
+            Tool::Sftp => "SFTP / SSH Tester",
+            Tool::DhcpClient => "DHCP Client Tester",
+            Tool::DnsClient => "DNS Client Tester",
+            Tool::CanBus => "CAN Bus Analyser",
+            Tool::Profinet => "PROFINET",
+            Tool::Bacnet => "BACnet",
+            Tool::OpcUa => "OPC UA",
+            Tool::Mqtt => "MQTT",
+            Tool::WebSocket => "WebSocket",
             Tool::PortAudit => "Open Port Audit",
             Tool::Firewall => "Firewall Tester",
             Tool::RogueDhcp => "Rogue DHCP Tester",
@@ -192,6 +238,17 @@ impl Tool {
             Tool::PortScan => "TCP scan of domains, addresses and ranges with banners",
             Tool::ServiceVersions => "Identify products and versions behind open ports",
             Tool::TlsScan => "Certificate chain, expiry, trust, TLS versions (incl. STARTTLS)",
+            Tool::Snmp => "SNMP v1/v2c get, walk and device summary; v3 engine discovery",
+            Tool::Ntp => "Query NTP servers: offset, delay, stratum, and compare sources",
+            Tool::Sftp => "SSH server algorithms and host key, login test, SFTP browse / transfer",
+            Tool::DhcpClient => "Run a full DHCP exchange and time each step of the lease",
+            Tool::DnsClient => "Benchmark and validate DNS servers: speed, failures, hijacking",
+            Tool::CanBus => "CAN / CAN FD via SocketCAN or slcan: monitor, send, statistics",
+            Tool::Profinet => "PROFINET DCP: discover devices, names, addresses, set name / IP",
+            Tool::Bacnet => "BACnet/IP: discover devices, browse objects, read properties",
+            Tool::OpcUa => "OPC UA: endpoints and security, browse the address space, read",
+            Tool::Mqtt => "MQTT client: publish, subscribe, topic tree and message rates",
+            Tool::WebSocket => "WebSocket client: handshake details, send, frame log",
             Tool::PortAudit => "Risk-rate open ports against a policy and a saved baseline",
             Tool::Firewall => "Outbound policy test, and open / closed / filtered on a target",
             Tool::RogueDhcp => "Find DHCP servers that are not on your authorised list",
@@ -228,6 +285,17 @@ impl Tool {
             Tool::PortScan => "ports",
             Tool::ServiceVersions => "versions",
             Tool::TlsScan => "tls",
+            Tool::Snmp => "snmp",
+            Tool::Ntp => "ntp",
+            Tool::Sftp => "sftp",
+            Tool::DhcpClient => "dhcp-client",
+            Tool::DnsClient => "dns-client",
+            Tool::CanBus => "can",
+            Tool::Profinet => "profinet",
+            Tool::Bacnet => "bacnet",
+            Tool::OpcUa => "opcua",
+            Tool::Mqtt => "mqtt",
+            Tool::WebSocket => "websocket",
             Tool::PortAudit => "audit",
             Tool::Firewall => "firewall",
             Tool::RogueDhcp => "rogue-dhcp",
@@ -262,6 +330,10 @@ impl Tool {
                 "trace" | "tracert" => Some(Tool::Traceroute),
                 "reverse-dns" | "ptr" => Some(Tool::ReverseDns),
                 "geo" | "geolocation" => Some(Tool::GeoIp),
+                "ssh" => Some(Tool::Sftp),
+                "ws" => Some(Tool::WebSocket),
+                "canbus" => Some(Tool::CanBus),
+                "opc-ua" => Some(Tool::OpcUa),
                 _ => None,
             })
     }
@@ -298,6 +370,17 @@ pub fn create(
         Tool::PortScan => make(cx, |cx| portscan_view::PortScanView::new(window, cx)),
         Tool::ServiceVersions => make(cx, |cx| audit_view::ServiceView::new(window, cx)),
         Tool::TlsScan => make(cx, |cx| tls_view::TlsView::new(window, cx)),
+        Tool::Snmp => make(cx, |cx| snmp_view::SnmpView::new(window, cx)),
+        Tool::Ntp => make(cx, |cx| ntp_view::NtpView::new(window, cx)),
+        Tool::Sftp => make(cx, |cx| sftp_view::SftpView::new(window, cx)),
+        Tool::DhcpClient => make(cx, |cx| dhcp_client_view::DhcpClientView::new(window, cx)),
+        Tool::DnsClient => make(cx, |cx| dns_client_view::DnsClientView::new(window, cx)),
+        Tool::CanBus => make(cx, |cx| can_view::CanView::new(window, cx)),
+        Tool::Profinet => make(cx, |cx| profinet_view::ProfinetView::new(window, cx)),
+        Tool::Bacnet => make(cx, |cx| bacnet_view::BacnetView::new(window, cx)),
+        Tool::OpcUa => make(cx, |cx| opcua_view::OpcUaView::new(window, cx)),
+        Tool::Mqtt => make(cx, |cx| mqtt_view::MqttView::new(window, cx)),
+        Tool::WebSocket => make(cx, |cx| ws_view::WsView::new(window, cx)),
         Tool::PortAudit => make(cx, |cx| audit_view::AuditView::new(window, cx)),
         Tool::Firewall => make(cx, |cx| firewall_view::FirewallView::new(window, cx)),
         Tool::RogueDhcp => make(cx, |cx| firewall_view::RogueDhcpView::new(window, cx)),

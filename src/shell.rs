@@ -5,8 +5,8 @@ use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 
 use gpui::{
-    AnyView, App, Context, Entity, FocusHandle, Focusable, Hsla, MouseButton, Rgba, Task, Window,
-    actions, div, prelude::*, px, rgb,
+    AnyView, App, Context, Entity, FocusHandle, Focusable, Hsla, MouseButton, Rgba, ScrollHandle,
+    Task, Window, actions, div, prelude::*, px, rgb,
 };
 
 use crate::tools::{Segment, Tool};
@@ -58,6 +58,7 @@ pub struct Shell {
     kiosk: bool,
     tool: Tool,
     sidebar: bool,
+    sidebar_scroll: ScrollHandle,
     confirm_quit: bool,
     lan: Entity<ScannerView>,
     views: HashMap<Tool, (AnyView, FocusHandle)>,
@@ -88,6 +89,7 @@ impl Shell {
             kiosk,
             tool: Tool::LanScan,
             sidebar: true,
+            sidebar_scroll: ScrollHandle::new(),
             confirm_quit: false,
             lan,
             views: HashMap::new(),
@@ -97,6 +99,15 @@ impl Shell {
     /// Switch tool, creating its view on first use, and focus it.
     pub fn select(&mut self, tool: Tool, window: &mut Window, cx: &mut Context<Self>) {
         self.tool = tool;
+        // Keep the selected entry visible (startup with --tool, Alt+↑/↓).
+        // On the very first frame the container's bounds are not known yet,
+        // so repeat the request on the next frame.
+        let (handle, row) = (self.sidebar_scroll.clone(), sidebar_row(tool));
+        handle.scroll_to_item(row);
+        window.on_next_frame(move |window, _| {
+            handle.scroll_to_item(row);
+            window.refresh();
+        });
         if !self.views.contains_key(&tool) {
             let v = crate::tools::create(tool, &self.lan, window, cx);
             self.views.insert(tool, v);
@@ -123,6 +134,59 @@ impl Shell {
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity().downgrade();
+        // Segment headers and tool rows are direct children of the scroll
+        // container so the scroll handle can bring a row into view by index
+        // (see `sidebar_row`).
+        let mut rows: Vec<gpui::AnyElement> = Vec::new();
+        for seg in Segment::ALL {
+            let tools: Vec<Tool> = Tool::ALL
+                .into_iter()
+                .filter(|t| t.segment() == seg)
+                .collect();
+            if tools.is_empty() {
+                continue;
+            }
+            rows.push(
+                div()
+                    .px_4()
+                    .pb_1()
+                    .when(!rows.is_empty(), |d| d.pt_3())
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(C::MUTED))
+                    .child(seg.label().to_uppercase())
+                    .into_any_element(),
+            );
+            for t in tools {
+                let active = self.tool == t;
+                let view = view.clone();
+                rows.push(
+                    div()
+                        .id(t.slug())
+                        .mx_2()
+                        .px_3()
+                        .py(px(5.))
+                        .rounded_md()
+                        .text_sm()
+                        .whitespace_nowrap()
+                        .cursor_pointer()
+                        .bg(if active {
+                            rgb(C::SELECT).into()
+                        } else {
+                            Hsla::transparent_black()
+                        })
+                        .text_color(rgb(if active { C::TEXT } else { 0xb7c0cf }))
+                        .when(active, |d| d.font_weight(gpui::FontWeight::SEMIBOLD))
+                        .hover(|s| s.bg(rgb(C::PANEL2)).text_color(rgb(C::TEXT)))
+                        .child(t.label())
+                        .tooltip(tip(t.describe()))
+                        .on_click(move |_, window, cx| {
+                            view.update(cx, |this, cx| this.select(t, window, cx)).ok();
+                        })
+                        .into_any_element(),
+                );
+            }
+        }
         div()
             .id("sidebar")
             .w(px(212.))
@@ -131,60 +195,12 @@ impl Shell {
             .py_3()
             .flex()
             .flex_col()
-            .gap_3()
             .bg(rgb(C::PANEL))
             .border_r_1()
             .border_color(rgb(C::BORDER))
             .overflow_y_scroll()
-            .children(Segment::ALL.iter().filter_map(|&seg| {
-                let tools: Vec<Tool> = Tool::ALL
-                    .into_iter()
-                    .filter(|t| t.segment() == seg)
-                    .collect();
-                if tools.is_empty() {
-                    return None;
-                }
-                Some(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .child(
-                            div()
-                                .px_4()
-                                .pb_1()
-                                .text_xs()
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(rgb(C::MUTED))
-                                .child(seg.label().to_uppercase()),
-                        )
-                        .children(tools.into_iter().map(|t| {
-                            let active = self.tool == t;
-                            let view = view.clone();
-                            div()
-                                .id(t.slug())
-                                .mx_2()
-                                .px_3()
-                                .py(px(5.))
-                                .rounded_md()
-                                .text_sm()
-                                .whitespace_nowrap()
-                                .cursor_pointer()
-                                .bg(if active {
-                                    rgb(C::SELECT).into()
-                                } else {
-                                    Hsla::transparent_black()
-                                })
-                                .text_color(rgb(if active { C::TEXT } else { 0xb7c0cf }))
-                                .when(active, |d| d.font_weight(gpui::FontWeight::SEMIBOLD))
-                                .hover(|s| s.bg(rgb(C::PANEL2)).text_color(rgb(C::TEXT)))
-                                .child(t.label())
-                                .tooltip(tip(t.describe()))
-                                .on_click(move |_, window, cx| {
-                                    view.update(cx, |this, cx| this.select(t, window, cx)).ok();
-                                })
-                        })),
-                )
-            }))
+            .track_scroll(&self.sidebar_scroll)
+            .children(rows)
     }
 
     fn toggle_fullscreen(
@@ -748,5 +764,43 @@ impl Render for Shell {
                 d.child(self.render_update_dialog(cx))
             })
             .when(self.confirm_quit, |d| d.child(self.render_quit_dialog(cx)))
+    }
+}
+
+/// Index of `tool`'s row among the sidebar's children (one header row per
+/// non-empty segment, then its tools).
+fn sidebar_row(tool: Tool) -> usize {
+    let mut row = 0;
+    for seg in Segment::ALL {
+        let tools: Vec<Tool> = Tool::ALL
+            .into_iter()
+            .filter(|t| t.segment() == seg)
+            .collect();
+        if tools.is_empty() {
+            continue;
+        }
+        row += 1;
+        if let Some(i) = tools.iter().position(|t| *t == tool) {
+            return row + i;
+        }
+        row += tools.len();
+    }
+    0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sidebar_rows_count_headers() {
+        // First segment: header at 0, first tool at 1.
+        assert_eq!(sidebar_row(Tool::ALL[0]), 1);
+        let headers = Segment::ALL
+            .iter()
+            .filter(|s| Tool::ALL.iter().any(|t| t.segment() == **s))
+            .count();
+        let last = *Tool::ALL.last().unwrap();
+        assert_eq!(sidebar_row(last), Tool::ALL.len() + headers - 1);
     }
 }

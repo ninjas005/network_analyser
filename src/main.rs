@@ -5,14 +5,22 @@ mod anomaly;
 mod arpwatch;
 mod audit;
 mod audit_view;
+mod bacnet;
+mod bacnet_view;
 mod bandwidth;
+mod can;
+mod can_view;
 mod capture;
 mod capture_view;
 mod cli_tools;
 mod dhcp;
+mod dhcp_client;
+mod dhcp_client_view;
 mod dhcp_view;
 mod dissect;
 mod dns;
+mod dns_client;
+mod dns_client_view;
 mod dns_view;
 mod dnscheck;
 mod firewall;
@@ -23,19 +31,31 @@ mod modbus;
 mod modbus_view;
 mod monitor;
 mod monitor_view;
+mod mqtt;
+mod mqtt_view;
 mod netconfig;
 mod netconfig_view;
 mod netinfo;
+mod ntp;
+mod ntp_view;
+mod opcua;
+mod opcua_view;
 mod perf_view;
 mod platform;
 mod portscan;
 mod portscan_view;
 mod probes;
+mod profinet;
+mod profinet_view;
 mod scanner;
 mod serial;
 mod serial_view;
 mod settings;
+mod sftp;
+mod sftp_view;
 mod shell;
+mod snmp;
+mod snmp_view;
 mod svcdetect;
 mod throughput;
 mod tls;
@@ -48,10 +68,12 @@ mod updater;
 mod utils_view;
 mod watch_view;
 mod webapi;
+mod websocket;
 mod widgets;
 mod wifi;
 mod wol;
 mod wol_view;
+mod ws_view;
 
 use std::time::Duration;
 
@@ -109,6 +131,32 @@ OPTIONS:
     --netconfig   Interfaces, routes and DNS servers
     --wol MAC [BROADCAST]
                   Send a Wake-on-LAN magic packet
+    --snmp HOST[:PORT] [summary | get OID… | walk OID | v3 | check [COMMUNITIES]]
+                  [-c COMMUNITY] [-1]
+                  SNMP device summary (default), get / walk, SNMPv3 engine
+                  discovery, or community check (-1 = SNMP v1)
+    --ssh [USER@]HOST[:PORT]
+                  SSH server audit: banner, algorithms (weak / Terrapin), host key
+                  fingerprint and offered login methods (no login attempted)
+    --ntp [SERVER…] [-n SAMPLES] [--all]
+                  Query NTP servers: offset, delay, stratum, local clock verdict
+    --dhcp-client [IFACE] [--mac MAC] [--request IP] [--inform] [--no-release] [--no-arp] [--repeat N]
+                  Full DHCP exchange from a test MAC with timing (needs capture rights)
+    --dnsbench [RESOLVER…] [-n ROUNDS] [--no-tcp] [--no-dot] [--quick]
+                  Benchmark and check DNS resolvers (UDP / TCP / DNS-over-TLS)
+    --can list    List SocketCAN interfaces and serial ports usable as slcan
+    --can IFACE|slcan:PORT [--bitrate N] [--listen] [--count N] [send ID#DATA ...]
+                  CAN monitor (candump-style), or send frames in cansend syntax
+    --profinet IFACE [--wait S]
+                  PROFINET DCP Identify All (needs capture rights)
+    --bacnet [TARGET] [--range LOW-HIGH] [--wait S] [--objects]
+                  BACnet/IP Who-Is discovery, device properties, optional object list
+    --opcua opc.tcp://HOST[:4840][/PATH] [browse]
+                  OPC UA endpoints and security review; 'browse' opens an anonymous session
+    --mqtt BROKER [TOPIC-FILTER] [SECONDS]
+                  Subscribe and print messages (mqtt://, mqtts://, host[:port])
+    --ws URL [MESSAGE]
+                  WebSocket handshake, send a message and a ping, print frames
     --list-ifaces List packet-capture interfaces
     --list-serial List serial ports
     --update-oui  Download the latest IEEE MAC-vendor list (needs curl)
@@ -172,6 +220,17 @@ fn main() {
             "--svc" => return cli_tools::svc(&args[i + 1..]),
             "--netconfig" => return cli_tools::netconfig(),
             "--wol" => return cli_tools::wol(&args[i + 1..]),
+            "--snmp" => return snmp::cli(&args[i + 1..]),
+            "--ntp" => return ntp::cli(&args[i + 1..]),
+            "--ssh" => return sftp::cli(&args[i + 1..]),
+            "--dhcp-client" => return dhcp_client::cli(&args[i + 1..]),
+            "--dnsbench" => return dns_client::cli(&args[i + 1..]),
+            "--can" => return can::cli(&args[i + 1..]),
+            "--profinet" => return profinet::cli(&args[i + 1..]),
+            "--bacnet" => return bacnet::cli(&args[i + 1..]),
+            "--opcua" => return opcua::cli(&args[i + 1..]),
+            "--mqtt" => return mqtt::cli(&args[i + 1..]),
+            "--ws" => return websocket::cli(&args[i + 1..]),
             "--list-ifaces" => {
                 match capture::interfaces() {
                     Ok(list) => {

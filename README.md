@@ -7,9 +7,10 @@ sidebar:
 | Segment | Tools |
 |---|---|
 | **Network Discovery** | LAN Scan · Gateway Discovery · Traceroute · DNS Lookup · Reverse DNS · DHCP Analyser · Wake-on-LAN |
-| **Ports & Services** | Port Scan · Service Versions · TLS Certificates |
+| **Ports & Services** | Port Scan · Service Versions · TLS Certificates · SNMP · NTP Analyser · SFTP / SSH Tester · DHCP Client Tester · DNS Client Tester |
 | **Packet Analysis** | Packet Capture (live or `.pcap`, decoding, traffic analysis) |
-| **Industrial Protocols** | Modbus RTU / TCP |
+| **Industrial Protocols** | Modbus RTU / TCP · CAN Bus Analyser · PROFINET · BACnet · OPC UA |
+| **IoT Protocols** | MQTT · WebSocket |
 | **Serial Communication** | Serial Monitor |
 | **Security & Audit** | Open Port Audit · Firewall Tester · Rogue DHCP Tester · ARP Spoof Detector · DNS Security · Anomaly Detector |
 | **Performance** | Bandwidth Monitor · Throughput Tester · Latency Monitor · Jitter Tester · Packet Loss Tester · Wi-Fi Analyser · Uptime Monitor |
@@ -70,7 +71,7 @@ Only scan hosts you own or are authorised to test.
 - **Analysis**: totals, rate and throughput, protocol breakdown, top talkers and
   conversations.
 
-**Permissions.** Capturing needs raw-socket rights:
+**Permissions.** Capturing needs raw-socket rights. The same rights are used by the tools that send raw Ethernet frames: PROFINET, DHCP Client Tester, DHCP Analyser and Rogue DHCP Tester. CAN through slcan adapters needs serial-port access (`dialout` group on Linux):
 
 | OS | Setup |
 |---|---|
@@ -164,6 +165,50 @@ Devices can be saved, and any device from the last LAN Scan can be picked by cli
   signature, SHA-256 fingerprint), whether the chain is trusted by the system's CA store and
   matches the name, and which of TLS 1.3 / 1.2 / 1.1 / 1.0 the server accepts. Legacy-only
   servers are still analysed. Ports 25, 587, 143, 110 and 21 use STARTTLS automatically.
+
+## SNMP, NTP, SSH and client testers
+
+- **SNMP**: v1 / v2c device summary (system group and the interface table with live traffic
+  rates), Get / GetNext / GetBulk / Walk / Set by OID or name, a check for default or writable
+  community strings, SNMPv3 engine discovery and a subnet sweep for agents.
+- **NTP Analyser**: samples each server several times (every address of a pool) and keeps the
+  best sample: offset, delay, jitter, stratum, decoded reference ID, leap and root distance.
+  Finds the system's configured time servers, flags servers that disagree and judges the local
+  clock.
+- **SFTP / SSH Tester**: without credentials it reads the banner, the server's algorithms (weak
+  ones and Terrapin exposure flagged), the host-key fingerprint (remembered and checked on later
+  connections) and the login methods offered. After logging in with a password or key it
+  browses files over SFTP, downloads, uploads and runs a write test, with timings.
+- **DHCP Client Tester**: a full DISCOVER → OFFER → REQUEST → ACK exchange from a test MAC (the
+  OS's DHCP client is untouched), timing each step and listing every offer. It ARP-checks the
+  leased address (DECLINE on conflict), can test INFORM, releases the lease afterwards and can
+  repeat for a timing series. Needs packet-capture rights.
+- **DNS Client Tester**: benchmarks resolvers over UDP, TCP and DNS-over-TLS with cached and
+  uncached names and ranks them; checks NXDOMAIN hijacking, DNSSEC validation, EDNS, TCP and
+  truncation handling, answer rewriting, consistency between resolvers and rebinding protection.
+
+## Industrial and IoT protocols
+
+- **CAN Bus Analyser**: CAN and CAN FD through SocketCAN (Linux) or an slcan / Lawicel USB adapter
+  (any OS). Frame log, per-ID rate, period and jitter with changed bytes highlighted, bus load
+  estimate and error frames; send single or periodic frames in `cansend` syntax.
+- **PROFINET**: DCP Identify All finds every device on the segment (station name, type, vendor /
+  device ID, role, IP settings); flash a device's LED and set its name or IP (temporary or
+  permanent, with confirmation). Listen mode shows cyclic real-time frames (cycle time,
+  RUN / STOP, data valid), alarms and LLDP neighbours. Needs packet-capture rights.
+- **BACnet**: BACnet/IP Who-Is discovery (also through BACnet routers and BBMDs), device
+  properties, the full object list with names, present values, units and status flags, and a
+  manual ReadProperty form.
+- **OPC UA**: a server's endpoints, security policies and login types, with insecure setups
+  flagged (no security, anonymous access, clear-text passwords, deprecated policies, certificate
+  problems). Then an anonymous or user-name session (SecurityPolicy None) to browse the address
+  space, read node attributes and watch live values.
+- **MQTT**: an MQTT 3.1.1 / 5.0 client over TCP or TLS. Subscribe with wildcards and watch a live
+  topic tree with counts, rates and payloads (text, JSON or hex); publish at QoS 0 / 1 / 2 with
+  retain; broker statistics from `$SYS`; a connection log with reason codes explained.
+- **WebSocket**: `ws://` and `wss://` with custom headers, subprotocols and Origin; shows the
+  upgrade request and response; send text, binary or pings and follow a frame log with ping
+  round-trip times and explained close codes.
 
 ## Security & Audit
 
@@ -475,7 +520,9 @@ network_analyser --windowed     # normal window
 network_analyser --kiosk --scan # start scanning the local subnet on launch
 network_analyser --cli [RANGE]  # headless, prints a table
 network_analyser --tool dns     # open a tool (lan, gateway, traceroute, dns, rdns, dhcp, wol,
-                                # ports, capture, modbus, serial, netconfig, publicip, geoip, base64)
+                                # ports, capture, modbus, serial, netconfig, publicip, geoip, base64,
+                                # snmp, ntp, sftp, dhcp-client, dns-client, can, profinet, bacnet,
+                                # opcua, mqtt, websocket, …)
 network_analyser --dns example.com MX @1.1.1.1   # headless DNS query (an IP = PTR lookup)
 network_analyser --trace 8.8.8.8                 # headless traceroute
 network_analyser --gateway      # headless gateway / NAT / DNS report
@@ -486,6 +533,17 @@ network_analyser --dnscheck example.com         # DNS / mail security report
 network_analyser --wifi         # nearby Wi-Fi networks and channel advice
 network_analyser --wol AA:BB:CC:DD:EE:FF [BROADCAST]
 network_analyser --portscan example.com,10.0.0.0/30 top,8000-8100   # headless port scan
+network_analyser --snmp 10.0.0.1 walk ifDescr  # SNMP summary / get / walk / v3 / check
+network_analyser --ntp pool.ntp.org             # NTP offset, delay, stratum
+network_analyser --ssh user@host                # SSH algorithms, host key, auth methods
+network_analyser --dnsbench 1.1.1.1 9.9.9.9     # resolver benchmark and checks
+network_analyser --dhcp-client eth0             # full DHCP exchange from a test MAC
+network_analyser --can can0                     # candump-style monitor (or slcan:/dev/ttyACM0)
+network_analyser --profinet eth0                # PROFINET DCP Identify All
+network_analyser --bacnet --objects             # BACnet/IP Who-Is and device details
+network_analyser --opcua opc.tcp://plc:4840 browse
+network_analyser --mqtt mqtts://broker:8883 'sensors/#' 30
+network_analyser --ws wss://echo.websocket.org hello
 network_analyser --list-ifaces  # capture interfaces
 network_analyser --list-serial  # serial ports
 network_analyser --update-oui   # refresh MAC-vendor DB (curl) -> ~/.local/share/network_analyser/oui.txt
