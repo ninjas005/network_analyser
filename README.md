@@ -7,16 +7,16 @@ sidebar:
 | Segment | Tools |
 |---|---|
 | **Network Discovery** | LAN Scan · Gateway Discovery · Traceroute · DNS Lookup · Reverse DNS · DHCP Analyser · Wake-on-LAN |
-| **Ports & Services** | Port Scan |
+| **Ports & Services** | Port Scan · Service Versions · TLS Certificates |
 | **Packet Analysis** | Packet Capture (live or `.pcap`, decoding, traffic analysis) |
 | **Industrial Protocols** | Modbus RTU / TCP |
 | **Serial Communication** | Serial Monitor |
+| **Security & Audit** | Open Port Audit · Firewall Tester · Rogue DHCP Tester · ARP Spoof Detector · DNS Security · Anomaly Detector |
+| **Performance** | Bandwidth Monitor · Throughput Tester · Latency Monitor · Jitter Tester · Packet Loss Tester · Wi-Fi Analyser · Uptime Monitor |
 | **Network Utilities** | Network Configuration · Public IP · IP Geolocation · Base64 |
 
-Coming next: Security & Audit (open-port audit, service versions, TLS certificates, firewall,
-rogue DHCP, ARP spoofing, DNS security, anomalies), Performance (bandwidth, throughput,
-latency, jitter, loss, Wi-Fi, uptime) and more industrial / IoT protocols (CAN bus, PROFINET,
-BACnet, OPC UA, MQTT, SNMP, NTP, WebSocket, SFTP, DHCP / DNS client testers).
+Coming next: more industrial and IoT protocols (CAN bus, PROFINET, BACnet, OPC UA, MQTT, SNMP,
+NTP, WebSocket, SFTP, DHCP / DNS client testers).
 
 Click a tool in the sidebar, or use **Alt+↑ / Alt+↓** to move between tools. **Ctrl+B**
 (**⌘B**) hides the sidebar. `--tool NAME` opens a tool directly (see [Run](#run)).
@@ -152,6 +152,66 @@ Sends a magic packet (UDP 9 or 7, optional SecureOn password) to a subnet broadc
 global broadcast or a unicast address, then optionally pings the device until it answers.
 Devices can be saved, and any device from the last LAN Scan can be picked by click.
 
+## Service Versions and TLS Certificates
+
+- **Service Versions** finds open ports and then speaks each protocol to identify the product
+  and version: SSH, FTP, SMTP, POP3, IMAP, HTTP(S) (`Server`, `X-Powered-By`, page title),
+  MySQL / MariaDB, PostgreSQL (and whether it offers TLS), Redis, memcached, VNC, RDP (security
+  layer), MQTT (anonymous access), DNS (`version.bind`), Docker API, Elasticsearch and Modbus
+  device identification. Security notes flag unauthenticated services and version disclosure.
+- **TLS Certificates** grades each host A–F and shows the negotiated protocol and cipher, every
+  certificate in the chain (subject, issuer, validity and days left, names, key type and size,
+  signature, SHA-256 fingerprint), whether the chain is trusted by the system's CA store and
+  matches the name, and which of TLS 1.3 / 1.2 / 1.1 / 1.0 the server accepts. Legacy-only
+  servers are still analysed. Ports 25, 587, 143, 110 and 21 use STARTTLS automatically.
+
+## Security & Audit
+
+- **Open Port Audit** scans hosts or ranges for ~120 ports and rates every open port against
+  built-in rules (Telnet, SMB, RDP, databases, Docker API, Redis, Modbus, S7, DNP3, EtherNet/IP,
+  BACnet…) with severity, risk and recommendation. **Save as baseline** remembers the result;
+  later audits highlight ports that appeared or closed.
+- **Firewall Tester**: *Outbound policy* checks which TCP ports this network lets out (against
+  a host that accepts every port, `portquiz.net` by default and configurable), plus external
+  DNS, NTP and ping. *Target path* classifies ports on a host as open, closed (reset) or
+  filtered (dropped) and explains what that says about the firewall in front of it.
+- **Rogue DHCP Tester** sends DHCPDISCOVERs (no lease is taken) and flags every server that is
+  not on your saved list of authorised DHCP servers.
+- **ARP Spoof Detector** watches the OS ARP table (no special rights) and, optionally, ARP
+  traffic: a gateway whose MAC changes, one MAC answering for the gateway and other addresses,
+  gratuitous-ARP floods, ARP scans and IP conflicts.
+- **DNS Security** checks a domain: name-server redundancy and SOA consistency, zone transfer
+  (AXFR) on every name server, DNSSEC (DS, DNSKEY, validation), SPF (policy, 10-lookup limit),
+  DMARC, DKIM (common and your own selectors), MTA-STS, TLS-RPT, CAA, plus whether your
+  resolver validates DNSSEC and whether a given server is an open resolver.
+- **Anomaly Detector** analyses live traffic in 10-second windows: port scans and host sweeps,
+  SYN / ICMP floods, broadcast and ARP storms, DHCP starvation, DNS tunnelling and NXDOMAIN
+  bursts, duplicate IPs, clear-text logins (Telnet, FTP, POP3/IMAP, HTTP Basic), new devices
+  (after a one-minute learning period) and traffic spikes.
+
+Rogue DHCP, ARP traffic watching and the Anomaly Detector need packet-capture rights.
+
+## Performance
+
+- **Bandwidth Monitor**: live download / upload rate, peaks, totals, packets per second and
+  errors for every interface, with two-minute charts.
+- **Throughput Tester**: start the server on one machine and run the client on another for
+  upload or download tests with 1–16 parallel TCP streams and a per-second chart (TCP/UDP
+  port 5299 by default; open it in the firewall). The **HTTP download test** measures internet
+  throughput against any large file URL (Cloudflare's speed-test endpoint by default).
+- **Latency Monitor**, **Jitter Tester**, **Packet Loss Tester** and **Uptime Monitor** probe
+  targets by ICMP ping, TCP connect, HTTP(S), DNS query or UDP echo (the Throughput Tester
+  server answers UDP echo, which allows sub-100 ms intervals).
+  - Latency: last / average / min / max / p95 / loss per target with a strip chart.
+  - Jitter: RFC 3550 jitter, standard deviation, RTT distribution and a VoIP MOS estimate
+    (ITU-T E-model).
+  - Packet loss: loss rate, number of loss bursts and the longest burst, with a timeline.
+  - Uptime: up / down state (two failed checks = outage), availability and an outage log.
+- **Wi-Fi Analyser**: nearby networks with signal, band, channel, security (weak ones flagged)
+  and vendor, your current link, per-channel congestion for 2.4 and 5 GHz and the
+  least-congested channel. Uses NetworkManager on Linux, `system_profiler` on macOS and
+  `netsh` on Windows (which needs Location access).
+
 ## Network Utilities
 
 - **Network Configuration**: hostname, interfaces (type, state, MAC and vendor, MTU, link speed,
@@ -171,7 +231,9 @@ button, and the tool shows which host it will contact. The provider URLs are con
 | Public IPv4 / IPv6 | `https://api.ipify.org?format=json` / `https://api6.ipify.org?format=json` | plain text or JSON with an `ip` field |
 | Geolocation | `https://ipapi.co/{ip}/json/` | any JSON; `{ip}` is replaced, e.g. `https://ipinfo.io/{ip}/json?token=…` |
 
-Settings (provider URLs, saved Wake-on-LAN devices) live in `settings.json` in
+Settings (provider URLs, the firewall test host, the HTTP download test URL, authorised DHCP
+servers, saved Wake-on-LAN devices) live in `settings.json`, and audit baselines in
+`audit-baseline.json`, in
 `~/.local/share/network_analyser/` (Linux), `~/Library/Application Support/network_analyser/`
 (macOS) or `%APPDATA%\network_analyser\` (Windows).
 
@@ -323,7 +385,7 @@ If you chose *Install for me only*, the path is under `%LOCALAPPDATA%\Programs` 
 ## Updates
 
 A few seconds after starting, the app checks GitHub for a newer release; the header shows
-**v1.1.0 · Check for updates**, **Up to date ✓** or a green **⬆ Update to x.y.z** button.
+**v1.2.0 · Check for updates**, **Up to date ✓** or a green **⬆ Update to x.y.z** button.
 The button opens the release notes and **Update now**, which downloads the right file for
 how the app was installed, verifies it against the release's `SHA256SUMS.txt`, installs it
 and restarts the app with the same options:
@@ -396,7 +458,7 @@ for every push and PR. To publish a release:
 
 ```sh
 # bump `version` in Cargo.toml first, commit, then:
-git tag v1.1.0 && git push origin v1.1.0
+git tag v1.2.0 && git push origin v1.2.0
 ```
 
 `.github/workflows/release.yml` refreshes the MAC-vendor list, builds the
@@ -418,6 +480,10 @@ network_analyser --dns example.com MX @1.1.1.1   # headless DNS query (an IP = P
 network_analyser --trace 8.8.8.8                 # headless traceroute
 network_analyser --gateway      # headless gateway / NAT / DNS report
 network_analyser --netconfig    # interfaces, routes, DNS servers
+network_analyser --tls example.com:443          # certificate and TLS version scan
+network_analyser --svc 10.0.0.5 top             # service and version detection
+network_analyser --dnscheck example.com         # DNS / mail security report
+network_analyser --wifi         # nearby Wi-Fi networks and channel advice
 network_analyser --wol AA:BB:CC:DD:EE:FF [BROADCAST]
 network_analyser --portscan example.com,10.0.0.0/30 top,8000-8100   # headless port scan
 network_analyser --list-ifaces  # capture interfaces
@@ -466,6 +532,12 @@ match, so `raspberry 22` finds Raspberry Pis with SSH open.
 - `src/netconfig.rs`, `src/netconfig_view.rs` – interfaces, routes, neighbours
 - `src/webapi.rs`, `src/utils_view.rs` – opt-in online lookups; Public IP, Geolocation, Base64
 - `src/settings.rs` – persistent `settings.json`
+- `src/tls.rs`, `src/tls_view.rs` – TLS scanner (rustls + x509-parser, legacy probe, STARTTLS)
+- `src/svcdetect.rs`, `src/audit.rs`, `src/audit_view.rs` – service / version detection, port audit rules and baselines
+- `src/firewall.rs`, `src/firewall_view.rs` – firewall tests, rogue DHCP tester
+- `src/arpwatch.rs`, `src/dnscheck.rs`, `src/anomaly.rs`, `src/watch_view.rs` – ARP spoof detection, DNS security, anomaly detection
+- `src/monitor.rs`, `src/monitor_view.rs` – probe engine and statistics (latency, jitter, loss, uptime)
+- `src/throughput.rs`, `src/bandwidth.rs`, `src/wifi.rs`, `src/perf_view.rs` – throughput server/client, interface counters, Wi-Fi scanning
 - `src/widgets.rs` – palette, buttons, chips, text input, table cells
 - `src/ui.rs` – LAN Scan tab (toolbar, table, details, status bar)
 - `src/portscan.rs`, `src/portscan_view.rs` – remote TCP port scanner and its tab

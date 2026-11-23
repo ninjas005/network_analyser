@@ -429,6 +429,117 @@ pub fn discover_frame(mac: [u8; 6], xid: u32) -> Vec<u8> {
     f
 }
 
+// ---------------------------------------------------------------- server probe
+
+#[derive(Clone, Debug)]
+pub struct Offer {
+    pub server: Ipv4Addr,
+    pub server_mac: Option<String>,
+    pub offered: Ipv4Addr,
+    pub message: Message,
+}
+
+pub enum ProbeEvent {
+    Status(String),
+    Offer(Box<Offer>),
+    Done(Result<usize, String>),
+}
+
+/// Send `rounds` DISCOVERs (1 s apart) on a pcap device and report every
+/// OFFER answering them; listens `wait` after the last one.
+pub fn find_servers(
+    device: String,
+    mac: [u8; 6],
+    rounds: u32,
+    wait: std::time::Duration,
+) -> std::sync::mpsc::Receiver<ProbeEvent> {
+    use std::time::{Duration, Instant};
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let cap = crate::capture::start(crate::capture::CaptureConfig {
+            source: crate::capture::Source::Live {
+                device,
+                promisc: false,
+            },
+            filter: "udp and (port 67 or port 68)".into(),
+            save_to: None,
+        });
+        let mut linktype = 1;
+        let mut xids: Vec<u32> = Vec::new();
+        let mut sent = 0;
+        let mut next_send = Instant::now();
+        let mut started = false;
+        let mut deadline: Option<Instant> = None;
+        let mut offers = 0;
+        loop {
+            while let Ok(ev) = cap.events.try_recv() {
+                match ev {
+                    crate::capture::CaptureEvent::Started { linktype: lt, .. } => {
+                        linktype = lt;
+                        started = true;
+                    }
+                    crate::capture::CaptureEvent::Packets(pkts) => {
+                        for p in pkts {
+                            let Some(u) = udp_payload(linktype, &p.data) else {
+                                continue;
+                            };
+                            let Some(m) = parse(u.payload) else { continue };
+                            if m.op == 2 && m.msg_type == Some(2) && xids.contains(&m.xid) {
+                                offers += 1;
+                                let _ = tx.send(ProbeEvent::Offer(Box::new(Offer {
+                                    server: m.server_id.unwrap_or(u.src),
+                                    server_mac: u.src_mac.clone(),
+                                    offered: m.yiaddr,
+                                    message: m,
+                                })));
+                            }
+                        }
+                    }
+                    crate::capture::CaptureEvent::Stopped(err) => {
+                        let _ = tx.send(ProbeEvent::Done(match err {
+                            Some(e) => Err(match crate::capture::permission_hint(&e) {
+                                Some(h) => format!("{e}. {h}"),
+                                None => e,
+                            }),
+                            None => Ok(offers),
+                        }));
+                        return;
+                    }
+                    crate::capture::CaptureEvent::InjectFailed(e) => {
+                        let _ = tx.send(ProbeEvent::Done(Err(format!(
+                            "could not send DISCOVER: {e}"
+                        ))));
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            if started && sent < rounds && Instant::now() >= next_send {
+                let t = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos())
+                    .unwrap_or(7);
+                let xid = t ^ (sent << 24) ^ std::process::id();
+                xids.push(xid);
+                cap.inject(discover_frame(mac, xid));
+                sent += 1;
+                let _ = tx.send(ProbeEvent::Status(format!("DISCOVER {sent}/{rounds} sent")));
+                next_send = Instant::now() + Duration::from_secs(1);
+                if sent == rounds {
+                    deadline = Some(Instant::now() + wait);
+                }
+            }
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                cap.stop();
+                let _ = tx.send(ProbeEvent::Done(Ok(offers)));
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    });
+    rx
+}
+
 pub fn parse_mac(s: &str) -> Option<[u8; 6]> {
     let hex: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
     if hex.len() != 12 {

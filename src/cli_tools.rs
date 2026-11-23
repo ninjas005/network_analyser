@@ -204,3 +204,137 @@ pub fn wol(args: &[String]) {
         Err(e) => fail(e),
     }
 }
+
+pub fn tls(args: &[String]) {
+    let Some(t) = args.first() else {
+        fail("usage: --tls HOST[:PORT]")
+    };
+    let r = crate::tls::scan(t, Duration::from_secs(6)).unwrap_or_else(|e| fail(e));
+    println!(
+        "{} ({}) — {} {} in {:.0} ms, ALPN {}",
+        r.host,
+        r.addr.map(|a| a.to_string()).unwrap_or_default(),
+        r.version,
+        r.cipher,
+        r.handshake_ms,
+        r.alpn.clone().unwrap_or("-".into())
+    );
+    println!(
+        "trust: {}",
+        match &r.trust {
+            Ok(()) => "OK (trusted chain, name matches)".to_string(),
+            Err(e) => format!("FAIL: {e}"),
+        }
+    );
+    for (v, s) in &r.versions {
+        println!(
+            "  {v}: {}",
+            match s {
+                Some(true) => "supported",
+                Some(false) => "not supported",
+                None => "not tested",
+            }
+        );
+    }
+    for (i, c) in r.chain.iter().enumerate() {
+        println!(
+            "[{i}] {}\n    issuer {}\n    valid {} .. {} ({} days left)  {} {} bits  {}{}{}",
+            c.subject,
+            c.issuer,
+            c.not_before,
+            c.not_after,
+            c.days_left,
+            c.key,
+            c.key_bits,
+            c.sig_alg,
+            if c.is_ca { "  CA" } else { "" },
+            if c.self_signed { "  self-signed" } else { "" }
+        );
+        if i == 0 && !c.sans.is_empty() {
+            println!(
+                "    SANs: {}",
+                c.sans
+                    .iter()
+                    .take(8)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+}
+
+fn print_findings(rx: std::sync::mpsc::Receiver<crate::gateway::GwEvent>) {
+    let mut section = String::new();
+    while let Ok(ev) = rx.recv() {
+        match ev {
+            crate::gateway::GwEvent::Finding(f) => {
+                if f.section != section {
+                    println!("\n[{}]", f.section);
+                    section = f.section.clone();
+                }
+                let mark = match f.level {
+                    crate::gateway::Level::Good => "ok ",
+                    crate::gateway::Level::Warn => "!! ",
+                    crate::gateway::Level::Bad => "XX ",
+                    crate::gateway::Level::Info => "   ",
+                };
+                println!("{mark}{:<24} {}", f.key, f.value);
+            }
+            crate::gateway::GwEvent::Status(s) => eprintln!("… {s}"),
+            crate::gateway::GwEvent::Done => break,
+        }
+    }
+}
+
+pub fn dnscheck(args: &[String]) {
+    let Some(d) = args.first() else {
+        fail("usage: --dnscheck DOMAIN")
+    };
+    print_findings(crate::dnscheck::check(d.clone(), Vec::new(), None));
+}
+
+pub fn wifi() {
+    let nets = crate::wifi::scan(false).unwrap_or_else(|e| fail(e));
+    for n in &nets {
+        println!(
+            "{} {:<28} {:<19} ch {:>3} {:<8} {:>4}  {}",
+            if n.in_use { "*" } else { " " },
+            n.ssid,
+            n.bssid.clone().unwrap_or_default(),
+            n.channel,
+            crate::wifi::band(n.channel, n.freq_mhz),
+            n.signal.map(|s| format!("{s}%")).unwrap_or_default(),
+            n.security
+        );
+    }
+    let (a, b) = crate::wifi::recommend(&nets);
+    println!("least congested: 2.4 GHz ch {a}, 5 GHz ch {b}");
+}
+
+pub fn svc(args: &[String]) {
+    let Some(host) = args.first() else {
+        fail("usage: --svc HOST PORT[,PORT…]")
+    };
+    let ip = crate::traceroute::resolve(host, false).unwrap_or_else(|e| fail(e));
+    let ports = crate::portscan::parse_ports(args.get(1).map(String::as_str).unwrap_or("top"))
+        .unwrap_or_else(|e| fail(e));
+    for p in ports {
+        if std::net::TcpStream::connect_timeout(
+            &std::net::SocketAddr::new(ip, p),
+            Duration::from_millis(800),
+        )
+        .is_err()
+        {
+            continue;
+        }
+        let d = crate::svcdetect::detect(ip, host, p, Duration::from_secs(3));
+        println!(
+            "{p:>5}/tcp {:<10} {:<22} {:<12} {}",
+            d.service, d.product, d.version, d.detail
+        );
+        for n in d.notes {
+            println!("          ! {n}");
+        }
+    }
+}

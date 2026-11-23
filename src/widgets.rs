@@ -631,3 +631,167 @@ pub fn copy_button(id: impl Into<gpui::ElementId>, text: String) -> gpui::Statef
 pub fn dot(color: u32) -> impl IntoElement {
     div().size(px(8.)).flex_none().rounded_full().bg(rgb(color))
 }
+
+// ---------------------------------------------------------------- charts & reports
+
+/// Vertical bar chart of a time series; `None` = lost sample (red stub).
+/// `max` <= 0 scales to the data.
+pub fn bar_chart(
+    values: &[Option<f32>],
+    width: f32,
+    height: f32,
+    max: f32,
+    color: u32,
+) -> gpui::Div {
+    bar_chart_slots(values, values.len(), width, height, max, color)
+}
+
+/// Like [`bar_chart`] with a fixed number of slots: bars are right-aligned so
+/// a growing series fills the chart like a strip chart.
+pub fn bar_chart_slots(
+    values: &[Option<f32>],
+    slots: usize,
+    width: f32,
+    height: f32,
+    max: f32,
+    color: u32,
+) -> gpui::Div {
+    let n = slots.max(values.len()).max(1);
+    let top = if max > 0.0 {
+        max
+    } else {
+        values.iter().flatten().copied().fold(0.0001f32, f32::max)
+    };
+    let bar_w = (width / n as f32).max(1.0);
+    div()
+        .w(px(width))
+        .h(px(height))
+        .flex_none()
+        .flex()
+        .flex_row()
+        .items_end()
+        .justify_end()
+        .overflow_hidden()
+        .rounded_sm()
+        .bg(rgb(C::BG))
+        .children(values.iter().map(|v| {
+            let (h, c) = match v {
+                Some(x) => ((x / top).clamp(0.02, 1.0) * height, color),
+                None => (height * 0.15, C::RED),
+            };
+            div()
+                .w(px(bar_w))
+                .h(px(h))
+                .flex_none()
+                .bg(rgb(c))
+                .border_r_1()
+                .border_color(rgb(C::BG))
+        }))
+}
+
+/// A small statistic tile.
+pub fn tile(
+    label_text: impl Into<SharedString>,
+    value: impl Into<SharedString>,
+    color: u32,
+) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .px_4()
+        .py_2()
+        .min_w(px(110.))
+        .rounded_md()
+        .bg(rgb(C::PANEL))
+        .border_1()
+        .border_color(rgb(C::BORDER))
+        .child(label(label_text))
+        .child(
+            div()
+                .text_xl()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(rgb(color))
+                .child(value.into()),
+        )
+}
+
+pub fn level_color(l: crate::gateway::Level) -> u32 {
+    match l {
+        crate::gateway::Level::Good => C::GREEN,
+        crate::gateway::Level::Warn => C::AMBER,
+        crate::gateway::Level::Bad => C::RED,
+        crate::gateway::Level::Info => 0x3a4252,
+    }
+}
+
+/// Findings grouped into section cards (Gateway Discovery, DNS security…).
+pub fn findings_cards(findings: &[crate::gateway::Finding]) -> gpui::Div {
+    let mut sections: Vec<(String, Vec<&crate::gateway::Finding>)> = Vec::new();
+    for f in findings {
+        match sections.iter_mut().find(|(s, _)| *s == f.section) {
+            Some((_, v)) => v.push(f),
+            None => sections.push((f.section.clone(), vec![f])),
+        }
+    }
+    div()
+        .flex()
+        .flex_wrap()
+        .content_start()
+        .gap_4()
+        .items_start()
+        .children(sections.into_iter().map(|(title, items)| {
+            div()
+                .w(px(560.))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_4()
+                .rounded_md()
+                .bg(rgb(C::PANEL))
+                .border_1()
+                .border_color(rgb(C::BORDER))
+                .text_sm()
+                .child(section_title(&title))
+                .children(items.into_iter().map(|f| {
+                    div()
+                        .flex()
+                        .items_start()
+                        .gap_2()
+                        .child(div().pt(px(6.)).child(dot(level_color(f.level))))
+                        .child(
+                            div()
+                                .w(px(170.))
+                                .flex_none()
+                                .text_color(rgb(C::MUTED))
+                                .child(f.key.clone()),
+                        )
+                        .child(div().flex_1().min_w_0().child(f.value.clone()))
+                }))
+        }))
+}
+
+/// Findings as plain text (Copy buttons).
+pub fn findings_text(findings: &[crate::gateway::Finding]) -> String {
+    let mut out = String::new();
+    let mut sec = "";
+    for f in findings {
+        if f.section != sec {
+            out.push_str(&format!("\n[{}]\n", f.section));
+            sec = &f.section;
+        }
+        out.push_str(&format!("{:<24} {}\n", f.key, f.value));
+    }
+    out
+}
+
+pub fn mbit(bits_per_sec: f64) -> String {
+    if bits_per_sec >= 1e9 {
+        format!("{:.2} Gbit/s", bits_per_sec / 1e9)
+    } else if bits_per_sec >= 1e6 {
+        format!("{:.1} Mbit/s", bits_per_sec / 1e6)
+    } else if bits_per_sec >= 1e3 {
+        format!("{:.0} kbit/s", bits_per_sec / 1e3)
+    } else {
+        format!("{bits_per_sec:.0} bit/s")
+    }
+}

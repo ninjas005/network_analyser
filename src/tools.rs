@@ -52,9 +52,24 @@ pub enum Tool {
     Dhcp,
     WakeOnLan,
     PortScan,
+    ServiceVersions,
+    TlsScan,
     Capture,
     Modbus,
     Serial,
+    PortAudit,
+    Firewall,
+    RogueDhcp,
+    ArpSpoof,
+    DnsSecurity,
+    Anomaly,
+    Bandwidth,
+    Throughput,
+    Latency,
+    Jitter,
+    PacketLoss,
+    Wifi,
+    Uptime,
     NetConfig,
     PublicIp,
     GeoIp,
@@ -63,7 +78,7 @@ pub enum Tool {
 
 impl Tool {
     /// Sidebar order (grouped by segment).
-    pub const ALL: [Tool; 15] = [
+    pub const ALL: [Tool; 30] = [
         Tool::LanScan,
         Tool::Gateway,
         Tool::Traceroute,
@@ -72,9 +87,24 @@ impl Tool {
         Tool::Dhcp,
         Tool::WakeOnLan,
         Tool::PortScan,
+        Tool::ServiceVersions,
+        Tool::TlsScan,
         Tool::Capture,
         Tool::Modbus,
         Tool::Serial,
+        Tool::PortAudit,
+        Tool::Firewall,
+        Tool::RogueDhcp,
+        Tool::ArpSpoof,
+        Tool::DnsSecurity,
+        Tool::Anomaly,
+        Tool::Bandwidth,
+        Tool::Throughput,
+        Tool::Latency,
+        Tool::Jitter,
+        Tool::PacketLoss,
+        Tool::Wifi,
+        Tool::Uptime,
         Tool::NetConfig,
         Tool::PublicIp,
         Tool::GeoIp,
@@ -90,7 +120,20 @@ impl Tool {
             | Tool::ReverseDns
             | Tool::Dhcp
             | Tool::WakeOnLan => Segment::Discovery,
-            Tool::PortScan => Segment::PortsServices,
+            Tool::PortScan | Tool::ServiceVersions | Tool::TlsScan => Segment::PortsServices,
+            Tool::PortAudit
+            | Tool::Firewall
+            | Tool::RogueDhcp
+            | Tool::ArpSpoof
+            | Tool::DnsSecurity
+            | Tool::Anomaly => Segment::Security,
+            Tool::Bandwidth
+            | Tool::Throughput
+            | Tool::Latency
+            | Tool::Jitter
+            | Tool::PacketLoss
+            | Tool::Wifi
+            | Tool::Uptime => Segment::Performance,
             Tool::Capture => Segment::PacketAnalysis,
             Tool::Modbus => Segment::Industrial,
             Tool::Serial => Segment::Serial,
@@ -108,6 +151,21 @@ impl Tool {
             Tool::Dhcp => "DHCP Analyser",
             Tool::WakeOnLan => "Wake-on-LAN",
             Tool::PortScan => "Port Scan",
+            Tool::ServiceVersions => "Service Versions",
+            Tool::TlsScan => "TLS Certificates",
+            Tool::PortAudit => "Open Port Audit",
+            Tool::Firewall => "Firewall Tester",
+            Tool::RogueDhcp => "Rogue DHCP Tester",
+            Tool::ArpSpoof => "ARP Spoof Detector",
+            Tool::DnsSecurity => "DNS Security",
+            Tool::Anomaly => "Anomaly Detector",
+            Tool::Bandwidth => "Bandwidth Monitor",
+            Tool::Throughput => "Throughput Tester",
+            Tool::Latency => "Latency Monitor",
+            Tool::Jitter => "Jitter Tester",
+            Tool::PacketLoss => "Packet Loss Tester",
+            Tool::Wifi => "Wi-Fi Analyser",
+            Tool::Uptime => "Uptime Monitor",
             Tool::Capture => "Packet Capture",
             Tool::Modbus => "Modbus RTU / TCP",
             Tool::Serial => "Serial Monitor",
@@ -132,6 +190,21 @@ impl Tool {
             Tool::Dhcp => "Watch DHCP traffic and find every DHCP server on the segment",
             Tool::WakeOnLan => "Send magic packets and confirm the device woke up",
             Tool::PortScan => "TCP scan of domains, addresses and ranges with banners",
+            Tool::ServiceVersions => "Identify products and versions behind open ports",
+            Tool::TlsScan => "Certificate chain, expiry, trust, TLS versions (incl. STARTTLS)",
+            Tool::PortAudit => "Risk-rate open ports against a policy and a saved baseline",
+            Tool::Firewall => "Outbound policy test, and open / closed / filtered on a target",
+            Tool::RogueDhcp => "Find DHCP servers that are not on your authorised list",
+            Tool::ArpSpoof => "Detect MAC changes, gateway impersonation and ARP floods",
+            Tool::DnsSecurity => "DNSSEC, SPF, DMARC, DKIM, CAA, zone transfer, resolver checks",
+            Tool::Anomaly => "Scans, floods, storms, DNS tunnelling, new devices, clear text",
+            Tool::Bandwidth => "Live per-interface throughput",
+            Tool::Throughput => "Measure TCP throughput between two machines, or an HTTP download",
+            Tool::Latency => "Continuous latency to several targets with charts",
+            Tool::Jitter => "Jitter, latency spread and a VoIP quality estimate",
+            Tool::PacketLoss => "Loss rate and loss bursts over a long probe series",
+            Tool::Wifi => "Nearby networks, signal, channel congestion and recommendations",
+            Tool::Uptime => "Watch hosts and services; outage log and availability",
             Tool::Capture => "Capture or open .pcap files, decode and analyse traffic",
             Tool::Modbus => "Modbus TCP / RTU master: read, poll, write, discover",
             Tool::Serial => "Serial port monitor, sender, Modbus RTU decoder, baud detection",
@@ -153,6 +226,21 @@ impl Tool {
             Tool::Dhcp => "dhcp",
             Tool::WakeOnLan => "wol",
             Tool::PortScan => "ports",
+            Tool::ServiceVersions => "versions",
+            Tool::TlsScan => "tls",
+            Tool::PortAudit => "audit",
+            Tool::Firewall => "firewall",
+            Tool::RogueDhcp => "rogue-dhcp",
+            Tool::ArpSpoof => "arp",
+            Tool::DnsSecurity => "dnssec",
+            Tool::Anomaly => "anomaly",
+            Tool::Bandwidth => "bandwidth",
+            Tool::Throughput => "throughput",
+            Tool::Latency => "latency",
+            Tool::Jitter => "jitter",
+            Tool::PacketLoss => "loss",
+            Tool::Wifi => "wifi",
+            Tool::Uptime => "uptime",
             Tool::Capture => "capture",
             Tool::Modbus => "modbus",
             Tool::Serial => "serial",
@@ -208,6 +296,29 @@ pub fn create(
             make(cx, |cx| wol_view::WolView::new(lan, window, cx))
         }
         Tool::PortScan => make(cx, |cx| portscan_view::PortScanView::new(window, cx)),
+        Tool::ServiceVersions => make(cx, |cx| audit_view::ServiceView::new(window, cx)),
+        Tool::TlsScan => make(cx, |cx| tls_view::TlsView::new(window, cx)),
+        Tool::PortAudit => make(cx, |cx| audit_view::AuditView::new(window, cx)),
+        Tool::Firewall => make(cx, |cx| firewall_view::FirewallView::new(window, cx)),
+        Tool::RogueDhcp => make(cx, |cx| firewall_view::RogueDhcpView::new(window, cx)),
+        Tool::ArpSpoof => make(cx, |cx| watch_view::ArpView::new(window, cx)),
+        Tool::DnsSecurity => make(cx, |cx| watch_view::DnsSecView::new(window, cx)),
+        Tool::Anomaly => make(cx, |cx| watch_view::AnomalyView::new(window, cx)),
+        Tool::Bandwidth => make(cx, |cx| perf_view::BandwidthView::new(window, cx)),
+        Tool::Throughput => make(cx, |cx| perf_view::ThroughputView::new(window, cx)),
+        Tool::Latency => make(cx, |cx| {
+            monitor_view::MonitorView::new(monitor_view::Purpose::Latency, window, cx)
+        }),
+        Tool::Jitter => make(cx, |cx| {
+            monitor_view::MonitorView::new(monitor_view::Purpose::Jitter, window, cx)
+        }),
+        Tool::PacketLoss => make(cx, |cx| {
+            monitor_view::MonitorView::new(monitor_view::Purpose::Loss, window, cx)
+        }),
+        Tool::Wifi => make(cx, |cx| perf_view::WifiView::new(window, cx)),
+        Tool::Uptime => make(cx, |cx| {
+            monitor_view::MonitorView::new(monitor_view::Purpose::Uptime, window, cx)
+        }),
         Tool::Capture => make(cx, |cx| capture_view::CaptureView::new(window, cx)),
         Tool::Modbus => make(cx, |cx| modbus_view::ModbusView::new(window, cx)),
         Tool::Serial => make(cx, |cx| serial_view::SerialView::new(window, cx)),

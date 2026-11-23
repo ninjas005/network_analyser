@@ -41,6 +41,9 @@ pub struct Dissected {
     pub dst_port: Option<u16>,
     /// "TCP" / "UDP" / "ICMP"… for conversation grouping.
     pub transport: Option<&'static str>,
+    pub eth_src: Option<String>,
+    pub eth_dst: Option<String>,
+    pub tcp_flags: Option<u8>,
 }
 
 impl Dissected {
@@ -175,6 +178,8 @@ fn ethernet(data: &[u8], d: &mut Dissected) {
     if let Some(v) = &vendor {
         l.f("Source vendor", v);
     }
+    d.eth_src = Some(src.clone());
+    d.eth_dst = Some(dst.clone());
     d.src = src;
     d.dst = if data[0..6] == [0xff; 6] {
         "Broadcast".into()
@@ -485,6 +490,7 @@ fn tcp(p: &[u8], d: &mut Dissected) {
     let payload = p.get(hl..).unwrap_or(&[]);
     d.src_port = Some(sp);
     d.dst_port = Some(dp);
+    d.tcp_flags = Some(flags);
     let mut l = Layer::new("Transmission Control Protocol");
     l.f("Source port", port_label(sp))
         .f("Destination port", port_label(dp))

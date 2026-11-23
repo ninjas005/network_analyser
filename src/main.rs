@@ -1,6 +1,11 @@
 // Windows: GUI app without a console window (see attach_parent_console).
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod anomaly;
+mod arpwatch;
+mod audit;
+mod audit_view;
+mod bandwidth;
 mod capture;
 mod capture_view;
 mod cli_tools;
@@ -9,13 +14,19 @@ mod dhcp_view;
 mod dissect;
 mod dns;
 mod dns_view;
+mod dnscheck;
+mod firewall;
+mod firewall_view;
 mod gateway;
 mod gateway_view;
 mod modbus;
 mod modbus_view;
+mod monitor;
+mod monitor_view;
 mod netconfig;
 mod netconfig_view;
 mod netinfo;
+mod perf_view;
 mod platform;
 mod portscan;
 mod portscan_view;
@@ -25,14 +36,20 @@ mod serial;
 mod serial_view;
 mod settings;
 mod shell;
+mod svcdetect;
+mod throughput;
+mod tls;
+mod tls_view;
 mod tools;
 mod trace_view;
 mod traceroute;
 mod ui;
 mod updater;
 mod utils_view;
+mod watch_view;
 mod webapi;
 mod widgets;
+mod wifi;
 mod wol;
 mod wol_view;
 
@@ -82,6 +99,13 @@ OPTIONS:
                   DNS query, e.g. --dns example.com MX @1.1.1.1
     --trace HOST  Traceroute
     --gateway     Gateway discovery report
+    --dnscheck DOMAIN
+                  DNS / mail security checks (DNSSEC, SPF, DMARC, AXFR…)
+    --svc HOST [PORTS]
+                  Service and version detection
+    --wifi        Wi-Fi networks and channel recommendation
+    --tls HOST[:PORT]
+                  TLS certificate and protocol scan (STARTTLS on 25/587/143/110/21)
     --netconfig   Interfaces, routes and DNS servers
     --wol MAC [BROADCAST]
                   Send a Wake-on-LAN magic packet
@@ -142,6 +166,10 @@ fn main() {
             "--dns" => return cli_tools::dns(&args[i + 1..]),
             "--trace" => return cli_tools::trace(&args[i + 1..]),
             "--gateway" => return cli_tools::gateway(),
+            "--tls" => return cli_tools::tls(&args[i + 1..]),
+            "--dnscheck" => return cli_tools::dnscheck(&args[i + 1..]),
+            "--wifi" => return cli_tools::wifi(),
+            "--svc" => return cli_tools::svc(&args[i + 1..]),
             "--netconfig" => return cli_tools::netconfig(),
             "--wol" => return cli_tools::wol(&args[i + 1..]),
             "--list-ifaces" => {
