@@ -1,16 +1,25 @@
 # Network Analyser
 
-A lightweight network and fieldbus toolkit with a GPUI interface, organised in tabs:
+A field-engineering toolkit that combines IT networking, industrial Ethernet, serial
+communication and IoT protocols in one GPUI app. Tools are grouped in segments in the
+sidebar:
 
-| Tab | What it does |
+| Segment | Tools |
 |---|---|
-| **LAN Scan** | Finds the live devices on a network and collects whatever it can about each one (no root needed) |
-| **Port Scan** | TCP connect scan of domain names, IPv4/IPv6 addresses and ranges, with service banners and HTTP titles |
-| **Packet Capture** | Live capture (libpcap / Npcap) or `.pcap`/`.pcapng` files: packet list, layer details, hex dump, traffic analysis |
-| **Serial** | Lists serial ports, connects with any line settings, monitors as text / hex / decoded Modbus RTU, sends data, detects the baud rate |
-| **Modbus** | Modbus TCP and RTU master: read/poll/write coils and registers, unit-ID and TCP server discovery, device identification, decoded traffic |
+| **Network Discovery** | LAN Scan · Gateway Discovery · Traceroute · DNS Lookup · Reverse DNS · DHCP Analyser · Wake-on-LAN |
+| **Ports & Services** | Port Scan |
+| **Packet Analysis** | Packet Capture (live or `.pcap`, decoding, traffic analysis) |
+| **Industrial Protocols** | Modbus RTU / TCP |
+| **Serial Communication** | Serial Monitor |
+| **Network Utilities** | Network Configuration · Public IP · IP Geolocation · Base64 |
 
-Switch tabs with a click or **Alt+1…5** (**⌘1…5** on macOS).
+Coming next: Security & Audit (open-port audit, service versions, TLS certificates, firewall,
+rogue DHCP, ARP spoofing, DNS security, anomalies), Performance (bandwidth, throughput,
+latency, jitter, loss, Wi-Fi, uptime) and more industrial / IoT protocols (CAN bus, PROFINET,
+BACnet, OPC UA, MQTT, SNMP, NTP, WebSocket, SFTP, DHCP / DNS client testers).
+
+Click a tool in the sidebar, or use **Alt+↑ / Alt+↓** to move between tools. **Ctrl+B**
+(**⌘B**) hides the sidebar. `--tool NAME` opens a tool directly (see [Run](#run)).
 
 ## LAN Scan
 
@@ -97,6 +106,74 @@ On Linux, add yourself to the `dialout` group to open serial ports:
   identification (FC43/14), or find Modbus TCP servers in an IP range.
 - **Traffic** shows every frame in hex with its decoding, and the status bar counts requests,
   exceptions, errors and the average response time.
+
+## Gateway Discovery
+
+Runs automatically when opened: default routes (IPv4 and IPv6, with metrics), the gateway's
+reachability, MAC and vendor, open management ports (SSH, Telnet, HTTP/S, DNS, UPnP) and web
+UI title, the external address the router reports via **NAT-PMP** and **UPnP-IGD**, a
+**double-NAT / carrier-grade NAT** check, and a health check of every configured DNS server
+(including the real upstreams behind a local stub such as systemd-resolved's 127.0.0.53).
+
+## Traceroute
+
+Path to a host with per-hop address, name, loss, last / average / best / worst latency and a
+latency bar. It needs no administrator rights: the system `ping` is run with an increasing TTL
+(all hops in parallel) to discover the path, then every hop is timed with direct echoes. Hops
+that ignore direct pings show an estimate marked "≈". IPv4 and IPv6.
+
+## DNS Lookup and Reverse DNS
+
+- **DNS Lookup** queries any record type (A, AAAA, CNAME, MX, NS, TXT, SOA, SRV, PTR, CAA,
+  HTTPS, DS, DNSKEY, TLSA, ANY…) on the system resolver, Google, Cloudflare, Quad9, OpenDNS or
+  any server (`10.0.0.53`, `[::1]:5353`), over UDP or TCP, with the DNSSEC (DO) and recursion
+  flags. It shows the answer, authority and additional sections with TTLs, the response
+  code, flags and timing. **Compare resolvers** sends the same query to every system and public
+  resolver side by side. Typing an IP address looks up its PTR name.
+- **Reverse DNS** resolves PTR names for lists and ranges (`192.168.1.0/24`, IPv6 addresses)
+  in parallel and checks that each name resolves back to the same address (forward-confirmed
+  reverse DNS).
+
+## DHCP Analyser
+
+Listens for DHCP on the chosen interface and lists every message (DISCOVER, OFFER, REQUEST, ACK,
+NAK…) with the client's MAC and vendor, hostname, offered or requested address, server and
+vendor class; click a message for every decoded option (router, DNS, lease and renewal times,
+domain search, classless routes, relay agent information, PXE architecture…). A summary lists
+each DHCP server seen, with a warning when more than one answers.
+
+**Find DHCP servers** broadcasts a DHCPDISCOVER (from this interface's MAC or a random one)
+and highlights every offer it receives. No REQUEST is sent, so no address is leased. This
+needs packet-capture rights (see [Packet Capture](#packet-capture)).
+
+## Wake-on-LAN
+
+Sends a magic packet (UDP 9 or 7, optional SecureOn password) to a subnet broadcast, the
+global broadcast or a unicast address, then optionally pings the device until it answers.
+Devices can be saved, and any device from the last LAN Scan can be picked by click.
+
+## Network Utilities
+
+- **Network Configuration**: hostname, interfaces (type, state, MAC and vendor, MTU, link speed,
+  IPv4 / IPv6 addresses), the routing table, DNS servers and the neighbour (ARP) cache.
+- **Public IP**: your public IPv4 and IPv6 addresses and whether this machine is behind NAT.
+- **IP Geolocation**: location, network owner (ASN / ISP) and time zone of any address, with a
+  map link.
+- **Base64**: encode / decode, standard or URL-safe alphabet, padding, 76-column MIME wrapping;
+  binary results are shown as a hex dump.
+
+**Online lookups** (Public IP, IP Geolocation) only contact a provider when you press the
+button, and the tool shows which host it will contact. The provider URLs are configurable
+(saved in `settings.json`, see below), so you can use your own service or a paid one:
+
+| Tool | Default | Format |
+|---|---|---|
+| Public IPv4 / IPv6 | `https://api.ipify.org?format=json` / `https://api6.ipify.org?format=json` | plain text or JSON with an `ip` field |
+| Geolocation | `https://ipapi.co/{ip}/json/` | any JSON; `{ip}` is replaced, e.g. `https://ipinfo.io/{ip}/json?token=…` |
+
+Settings (provider URLs, saved Wake-on-LAN devices) live in `settings.json` in
+`~/.local/share/network_analyser/` (Linux), `~/Library/Application Support/network_analyser/`
+(macOS) or `%APPDATA%\network_analyser\` (Windows).
 
 ## Install
 
@@ -246,7 +323,7 @@ If you chose *Install for me only*, the path is under `%LOCALAPPDATA%\Programs` 
 ## Updates
 
 A few seconds after starting, the app checks GitHub for a newer release; the header shows
-**v1.0.1 · Check for updates**, **Up to date ✓** or a green **⬆ Update to x.y.z** button.
+**v1.1.0 · Check for updates**, **Up to date ✓** or a green **⬆ Update to x.y.z** button.
 The button opens the release notes and **Update now**, which downloads the right file for
 how the app was installed, verifies it against the release's `SHA256SUMS.txt`, installs it
 and restarts the app with the same options:
@@ -319,7 +396,7 @@ for every push and PR. To publish a release:
 
 ```sh
 # bump `version` in Cargo.toml first, commit, then:
-git tag v1.0.1 && git push origin v1.0.1
+git tag v1.1.0 && git push origin v1.1.0
 ```
 
 `.github/workflows/release.yml` refreshes the MAC-vendor list, builds the
@@ -335,7 +412,13 @@ network_analyser --kiosk        # locked fullscreen, no decorations, F11 disable
 network_analyser --windowed     # normal window
 network_analyser --kiosk --scan # start scanning the local subnet on launch
 network_analyser --cli [RANGE]  # headless, prints a table
-network_analyser --tab modbus   # open on a tab: lan, ports, capture, serial, modbus
+network_analyser --tool dns     # open a tool (lan, gateway, traceroute, dns, rdns, dhcp, wol,
+                                # ports, capture, modbus, serial, netconfig, publicip, geoip, base64)
+network_analyser --dns example.com MX @1.1.1.1   # headless DNS query (an IP = PTR lookup)
+network_analyser --trace 8.8.8.8                 # headless traceroute
+network_analyser --gateway      # headless gateway / NAT / DNS report
+network_analyser --netconfig    # interfaces, routes, DNS servers
+network_analyser --wol AA:BB:CC:DD:EE:FF [BROADCAST]
 network_analyser --portscan example.com,10.0.0.0/30 top,8000-8100   # headless port scan
 network_analyser --list-ifaces  # capture interfaces
 network_analyser --list-serial  # serial ports
@@ -351,7 +434,8 @@ Ctrl+V pastes.
 
 | Key | Action |
 |---|---|
-| Alt+1…5 (⌘1…5 on macOS) | Switch tab |
+| Alt+↑ / Alt+↓ | Previous / next tool |
+| Ctrl+B (⌘B on macOS) | Show / hide the sidebar |
 | F5 / Ctrl+R / Enter in range box | Start / stop LAN scan |
 | Ctrl+F | Focus search (Esc clears it, Esc again leaves the box) |
 | F6 | Toggle live-only / all addresses |
@@ -371,7 +455,17 @@ match, so `raspberry 22` finds Raspberry Pis with SSH open.
 ## Layout
 
 - `src/main.rs` – CLI flags, window/kiosk setup, key bindings, headless modes
-- `src/shell.rs` – root view: tab bar, quit dialog
+- `src/shell.rs` – root view: header, segment sidebar, update and quit dialogs
+- `src/tools.rs` – tool registry: segments, names, `--tool` slugs, view construction
+- `src/cli_tools.rs` – headless `--dns`, `--trace`, `--gateway`, `--netconfig`, `--wol`
+- `src/gateway.rs`, `src/gateway_view.rs` – gateway / NAT-PMP / UPnP-IGD / DNS health
+- `src/traceroute.rs`, `src/trace_view.rs` – ping-based traceroute
+- `src/dns.rs`, `src/dns_view.rs` – DNS client (all record types, EDNS/DNSSEC, TCP fallback), lookup and reverse tools
+- `src/dhcp.rs`, `src/dhcp_view.rs` – DHCP parsing / DISCOVER frames, DHCP analyser
+- `src/wol.rs`, `src/wol_view.rs` – Wake-on-LAN
+- `src/netconfig.rs`, `src/netconfig_view.rs` – interfaces, routes, neighbours
+- `src/webapi.rs`, `src/utils_view.rs` – opt-in online lookups; Public IP, Geolocation, Base64
+- `src/settings.rs` – persistent `settings.json`
 - `src/widgets.rs` – palette, buttons, chips, text input, table cells
 - `src/ui.rs` – LAN Scan tab (toolbar, table, details, status bar)
 - `src/portscan.rs`, `src/portscan_view.rs` – remote TCP port scanner and its tab

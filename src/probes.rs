@@ -401,7 +401,12 @@ async fn http_get_url(url: &str, expect_ip: Ipv4Addr) -> Option<String> {
 // ---------------------------------------------------------------- reverse DNS
 
 pub async fn reverse_dns(ip: Ipv4Addr) -> Option<String> {
-    let task = tokio::task::spawn_blocking(move || dns_lookup::lookup_addr(&ip.into()).ok());
+    reverse_dns_any(ip.into()).await
+}
+
+/// System resolver PTR lookup (IPv4 or IPv6), 3 s timeout.
+pub async fn reverse_dns_any(ip: IpAddr) -> Option<String> {
+    let task = tokio::task::spawn_blocking(move || dns_lookup::lookup_addr(&ip).ok());
     let name = timeout(Duration::from_secs(3), task).await.ok()?.ok()??;
     (name != ip.to_string()).then_some(name)
 }

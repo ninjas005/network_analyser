@@ -134,17 +134,24 @@ pub enum CaptureEvent {
         dropped: u32,
         if_dropped: u32,
     },
+    InjectFailed(String),
     Stopped(Option<String>),
 }
 
 pub struct CaptureHandle {
     pub events: Receiver<CaptureEvent>,
     stop: Arc<AtomicBool>,
+    inject: Sender<Vec<u8>>,
 }
 
 impl CaptureHandle {
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
+    }
+    /// Transmit a raw frame on a live capture's interface (pcap_sendpacket).
+    /// Failures are reported as [`CaptureEvent::InjectFailed`].
+    pub fn inject(&self, frame: Vec<u8>) {
+        let _ = self.inject.send(frame);
     }
 }
 
@@ -156,16 +163,21 @@ impl Drop for CaptureHandle {
 
 pub fn start(cfg: CaptureConfig) -> CaptureHandle {
     let (tx, rx) = channel();
+    let (itx, irx) = channel();
     let stop = Arc::new(AtomicBool::new(false));
     let flag = stop.clone();
     std::thread::Builder::new()
         .name("capture".into())
         .spawn(move || {
-            let err = run(cfg, &tx, &flag).err();
+            let err = run(cfg, &tx, &flag, &irx).err();
             let _ = tx.send(CaptureEvent::Stopped(err));
         })
         .expect("spawn capture thread");
-    CaptureHandle { events: rx, stop }
+    CaptureHandle {
+        events: rx,
+        stop,
+        inject: itx,
+    }
 }
 
 /// Batches packets so a busy link doesn't flood the UI channel.
@@ -206,7 +218,12 @@ impl Batcher<'_> {
     }
 }
 
-fn run(cfg: CaptureConfig, tx: &Sender<CaptureEvent>, stop: &AtomicBool) -> Result<(), String> {
+fn run(
+    cfg: CaptureConfig,
+    tx: &Sender<CaptureEvent>,
+    stop: &AtomicBool,
+    inject: &Receiver<Vec<u8>>,
+) -> Result<(), String> {
     available()?;
     match &cfg.source {
         Source::File(path) => {
@@ -276,6 +293,11 @@ fn run(cfg: CaptureConfig, tx: &Sender<CaptureEvent>, stop: &AtomicBool) -> Resu
             };
             let mut last_stats = Instant::now();
             while !stop.load(Ordering::Relaxed) {
+                while let Ok(frame) = inject.try_recv() {
+                    if let Err(e) = cap.sendpacket(frame) {
+                        let _ = tx.send(CaptureEvent::InjectFailed(e.to_string()));
+                    }
+                }
                 match cap.next_packet() {
                     Ok(p) => {
                         if let Some(s) = save.as_mut() {

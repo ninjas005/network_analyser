@@ -231,6 +231,14 @@ impl ScannerView {
         cx.notify();
     }
 
+    /// Live hosts with a known MAC from the last scan: (ip, mac, name).
+    pub fn known_macs(&self) -> Vec<(std::net::Ipv4Addr, String, Option<String>)> {
+        self.hosts
+            .iter()
+            .filter_map(|h| Some((h.ip, h.mac.clone()?, h.hostname())))
+            .collect()
+    }
+
     /// Stop any running scan (app is quitting).
     pub fn cancel(&self) {
         if let Some(s) = &self.scan {

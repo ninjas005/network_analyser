@@ -3,9 +3,18 @@
 
 mod capture;
 mod capture_view;
+mod cli_tools;
+mod dhcp;
+mod dhcp_view;
 mod dissect;
+mod dns;
+mod dns_view;
+mod gateway;
+mod gateway_view;
 mod modbus;
 mod modbus_view;
+mod netconfig;
+mod netconfig_view;
 mod netinfo;
 mod platform;
 mod portscan;
@@ -14,10 +23,18 @@ mod probes;
 mod scanner;
 mod serial;
 mod serial_view;
+mod settings;
 mod shell;
+mod tools;
+mod trace_view;
+mod traceroute;
 mod ui;
 mod updater;
+mod utils_view;
+mod webapi;
 mod widgets;
+mod wol;
+mod wol_view;
 
 use std::time::Duration;
 
@@ -27,15 +44,16 @@ use gpui::{
 };
 
 use shell::{
-    CancelDialog, Quit, RequestQuit, Shell, Tab, Tab1, Tab2, Tab3, Tab4, Tab5, ToggleFullscreen,
+    CancelDialog, NextTool, PrevTool, Quit, RequestQuit, Shell, ToggleFullscreen, ToggleSidebar,
 };
+use tools::Tool;
 use ui::{ClearSearch, Export, FocusSearch, ScannerView, StartStop, ToggleFilter};
 
 const USAGE: &str = "\
 network_analyser - LAN scanner, port scanner, packet capture, serial and Modbus tool
 
 USAGE:
-    network_analyser [--kiosk | --windowed] [--scan] [--tab TAB]
+    network_analyser [--kiosk | --windowed] [--scan] [--tool TOOL]
     network_analyser --cli [RANGE]
     network_analyser --portscan TARGETS [PORTS]
 
@@ -45,7 +63,9 @@ OPTIONS:
                   the Quit button, Esc (with confirmation) or Ctrl+Q
     --windowed    Open in a normal window (development)
     --scan        Start scanning the local subnet immediately
-    --tab TAB     Open on a tab: lan, ports, capture, serial, modbus
+    --tool TOOL   Open a tool: lan, gateway, traceroute, dns, rdns, dhcp,
+                  wol, ports, capture, modbus, serial, netconfig,
+                  publicip, geoip, base64 (--tab is an alias)
     --no-update-check
                   Don't look for a new release on start (also:
                   NETWORK_ANALYSER_NO_UPDATE_CHECK=1)
@@ -58,6 +78,13 @@ OPTIONS:
                   --portscan example.com,10.0.0.0/30 top,8000-8100
     --check-update
                   Print whether a newer release is available
+    --dns NAME [TYPE] [@SERVER]
+                  DNS query, e.g. --dns example.com MX @1.1.1.1
+    --trace HOST  Traceroute
+    --gateway     Gateway discovery report
+    --netconfig   Interfaces, routes and DNS servers
+    --wol MAC [BROADCAST]
+                  Send a Wake-on-LAN magic packet
     --list-ifaces List packet-capture interfaces
     --list-serial List serial ports
     --update-oui  Download the latest IEEE MAC-vendor list (needs curl)
@@ -78,7 +105,7 @@ fn main() {
     }
     let mut mode = Mode::Fullscreen;
     let mut autoscan = false;
-    let mut tab = Tab::Lan;
+    let mut tab = Tool::LanScan;
     let mut update_check = std::env::var_os("NETWORK_ANALYSER_NO_UPDATE_CHECK").is_none();
     let mut i = 0;
     while i < args.len() {
@@ -94,10 +121,11 @@ fn main() {
                     std::process::exit(2);
                 }
             }
-            "--tab" => {
+            "--tab" | "--tool" => {
                 i += 1;
-                tab = args.get(i).and_then(|t| Tab::parse(t)).unwrap_or_else(|| {
-                    eprintln!("--tab: expected lan, ports, capture, serial or modbus");
+                tab = args.get(i).and_then(|t| Tool::parse(t)).unwrap_or_else(|| {
+                    let names: Vec<&str> = Tool::ALL.iter().map(|t| t.slug()).collect();
+                    eprintln!("--tool: expected one of {}", names.join(", "));
                     std::process::exit(2)
                 });
             }
@@ -111,6 +139,11 @@ fn main() {
                 };
                 return run_portscan(targets, args.get(i + 2).cloned());
             }
+            "--dns" => return cli_tools::dns(&args[i + 1..]),
+            "--trace" => return cli_tools::trace(&args[i + 1..]),
+            "--gateway" => return cli_tools::gateway(),
+            "--netconfig" => return cli_tools::netconfig(),
+            "--wol" => return cli_tools::wol(&args[i + 1..]),
             "--list-ifaces" => {
                 match capture::interfaces() {
                     Ok(list) => {
@@ -184,7 +217,7 @@ fn run_check_update() {
     }
 }
 
-fn run_gui(mode: Mode, autoscan: bool, tab: Tab, update_check: bool) {
+fn run_gui(mode: Mode, autoscan: bool, tab: Tool, update_check: bool) {
     let kiosk = mode == Mode::Kiosk;
     Application::new().run(move |cx: &mut App| {
         cx.bind_keys([
@@ -195,16 +228,9 @@ fn run_gui(mode: Mode, autoscan: bool, tab: Tab, update_check: bool) {
             KeyBinding::new("secondary-e", Export, Some("Scanner")),
             KeyBinding::new("f11", ToggleFullscreen, Some("Shell")),
             KeyBinding::new("escape", RequestQuit, Some("Shell")),
-            KeyBinding::new("alt-1", Tab1, Some("Shell")),
-            KeyBinding::new("alt-2", Tab2, Some("Shell")),
-            KeyBinding::new("alt-3", Tab3, Some("Shell")),
-            KeyBinding::new("alt-4", Tab4, Some("Shell")),
-            KeyBinding::new("alt-5", Tab5, Some("Shell")),
-            KeyBinding::new("cmd-1", Tab1, Some("Shell")),
-            KeyBinding::new("cmd-2", Tab2, Some("Shell")),
-            KeyBinding::new("cmd-3", Tab3, Some("Shell")),
-            KeyBinding::new("cmd-4", Tab4, Some("Shell")),
-            KeyBinding::new("cmd-5", Tab5, Some("Shell")),
+            KeyBinding::new("alt-up", PrevTool, Some("Shell")),
+            KeyBinding::new("alt-down", NextTool, Some("Shell")),
+            KeyBinding::new("secondary-b", ToggleSidebar, Some("Shell")),
             KeyBinding::new("escape", CancelDialog, Some("QuitDialog")),
             KeyBinding::new("enter", Quit, Some("QuitDialog")),
             KeyBinding::new("secondary-f", FocusSearch, Some("Scanner")),

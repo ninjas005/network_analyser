@@ -28,10 +28,10 @@ network_analyser --kiosk        # locked fullscreen, no window decorations
 network_analyser --windowed     # normal window
 network_analyser --scan         # start scanning the local subnet on launch
 network_analyser --cli [RANGE]  # headless scan to stdout
-network_analyser --tab capture  # open on a tab: lan, ports, capture, serial, modbus
+network_analyser --tool dns     # open a tool directly
 network_analyser --portscan example.com top   # headless port scan
 ```
 
-Tabs: **LAN Scan**, **Port Scan** (domains / IPs / ranges), **Packet Capture** (live or .pcap, with analysis), **Serial** (monitor, send, Modbus RTU decode, baud detection) and **Modbus** (TCP/RTU master, polling, writes, discovery). Switch with Alt+1…5.
+Tools are grouped in the sidebar: **Network Discovery** (LAN Scan, Gateway Discovery, Traceroute, DNS Lookup, Reverse DNS, DHCP Analyser, Wake-on-LAN), **Ports & Services** (Port Scan), **Packet Analysis** (Packet Capture), **Industrial Protocols** (Modbus RTU/TCP), **Serial Communication** (Serial Monitor) and **Network Utilities** (Network Configuration, Public IP, IP Geolocation, Base64). Alt+↑/↓ moves between tools. The app checks for updates on start and can update itself.
 
 Quit: **✕ Quit** button, **Esc** (confirm with Enter), or **Ctrl+Q** (**⌘Q** on macOS).

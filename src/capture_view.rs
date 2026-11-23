@@ -330,6 +330,7 @@ impl CaptureView {
                     dropped,
                     if_dropped,
                 } => self.pcap_stats = Some((received, dropped, if_dropped)),
+                CaptureEvent::InjectFailed(e) => self.error = Some(format!("send failed: {e}")),
                 CaptureEvent::Stopped(err) => stopped = Some(err),
             }
         }

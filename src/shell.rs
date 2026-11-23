@@ -1,5 +1,6 @@
-//! Root view: title + tab bar, the active tool, and the quit dialog.
+//! Root view: header, segment sidebar, the active tool, update and quit dialogs.
 
+use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 
@@ -8,10 +9,7 @@ use gpui::{
     actions, div, prelude::*, px, rgb,
 };
 
-use crate::capture_view::CaptureView;
-use crate::modbus_view::ModbusView;
-use crate::portscan_view::PortScanView;
-use crate::serial_view::SerialView;
+use crate::tools::{Segment, Tool};
 use crate::ui::ScannerView;
 use crate::updater::{self, InstallKind, Progress, Release};
 use crate::widgets::{C, button, chip, progress, tip};
@@ -23,45 +21,11 @@ actions!(
         RequestQuit,
         CancelDialog,
         ToggleFullscreen,
-        Tab1,
-        Tab2,
-        Tab3,
-        Tab4,
-        Tab5
+        PrevTool,
+        NextTool,
+        ToggleSidebar
     ]
 );
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Tab {
-    Lan,
-    Ports,
-    Capture,
-    Serial,
-    Modbus,
-}
-
-impl Tab {
-    pub const ALL: [Tab; 5] = [Tab::Lan, Tab::Ports, Tab::Capture, Tab::Serial, Tab::Modbus];
-    fn label(self) -> &'static str {
-        match self {
-            Tab::Lan => "LAN Scan",
-            Tab::Ports => "Port Scan",
-            Tab::Capture => "Packet Capture",
-            Tab::Serial => "Serial",
-            Tab::Modbus => "Modbus",
-        }
-    }
-    pub fn parse(s: &str) -> Option<Tab> {
-        match s {
-            "lan" | "scan" => Some(Tab::Lan),
-            "ports" | "portscan" => Some(Tab::Ports),
-            "capture" => Some(Tab::Capture),
-            "serial" => Some(Tab::Serial),
-            "modbus" => Some(Tab::Modbus),
-            _ => None,
-        }
-    }
-}
 
 /// "Check for updates" state shown in the header.
 enum Update {
@@ -92,13 +56,11 @@ pub struct Shell {
     _update_poll: Option<Task<()>>,
     focus: FocusHandle,
     kiosk: bool,
-    tab: Tab,
+    tool: Tool,
+    sidebar: bool,
     confirm_quit: bool,
     lan: Entity<ScannerView>,
-    ports: Option<Entity<PortScanView>>,
-    capture: Option<Entity<CaptureView>>,
-    serial: Option<Entity<SerialView>>,
-    modbus: Option<Entity<ModbusView>>,
+    views: HashMap<Tool, (AnyView, FocusHandle)>,
 }
 
 impl Shell {
@@ -124,52 +86,105 @@ impl Shell {
             _update_poll: None,
             focus: cx.focus_handle(),
             kiosk,
-            tab: Tab::Lan,
+            tool: Tool::LanScan,
+            sidebar: true,
             confirm_quit: false,
             lan,
-            ports: None,
-            capture: None,
-            serial: None,
-            modbus: None,
+            views: HashMap::new(),
         }
     }
 
-    /// Switch tab, creating the tool on first use, and focus it.
-    pub fn select(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
-        self.tab = tab;
-        let focus = match tab {
-            Tab::Lan => self.lan.focus_handle(cx),
-            Tab::Ports => self
-                .ports
-                .get_or_insert_with(|| cx.new(|cx| PortScanView::new(window, cx)))
-                .focus_handle(cx),
-            Tab::Capture => self
-                .capture
-                .get_or_insert_with(|| cx.new(|cx| CaptureView::new(window, cx)))
-                .focus_handle(cx),
-            Tab::Serial => self
-                .serial
-                .get_or_insert_with(|| cx.new(|cx| SerialView::new(window, cx)))
-                .focus_handle(cx),
-            Tab::Modbus => self
-                .modbus
-                .get_or_insert_with(|| cx.new(|cx| ModbusView::new(window, cx)))
-                .focus_handle(cx),
-        };
-        window.focus(&focus);
+    /// Switch tool, creating its view on first use, and focus it.
+    pub fn select(&mut self, tool: Tool, window: &mut Window, cx: &mut Context<Self>) {
+        self.tool = tool;
+        if !self.views.contains_key(&tool) {
+            let v = crate::tools::create(tool, &self.lan, window, cx);
+            self.views.insert(tool, v);
+        }
+        if let Some((_, focus)) = self.views.get(&tool) {
+            window.focus(focus);
+        }
         cx.notify();
     }
 
+    fn step_tool(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let all = Tool::ALL;
+        let i = all.iter().position(|t| *t == self.tool).unwrap_or(0) as isize;
+        let n = all.len() as isize;
+        self.select(all[((i + delta) % n + n) as usize % n as usize], window, cx);
+    }
+
     fn active_view(&self) -> AnyView {
-        let lan = AnyView::from(self.lan.clone());
-        match self.tab {
-            Tab::Lan => Some(lan.clone()),
-            Tab::Ports => self.ports.clone().map(AnyView::from),
-            Tab::Capture => self.capture.clone().map(AnyView::from),
-            Tab::Serial => self.serial.clone().map(AnyView::from),
-            Tab::Modbus => self.modbus.clone().map(AnyView::from),
-        }
-        .unwrap_or(lan)
+        self.views
+            .get(&self.tool)
+            .map(|(v, _)| v.clone())
+            .unwrap_or_else(|| self.lan.clone().into())
+    }
+
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity().downgrade();
+        div()
+            .id("sidebar")
+            .w(px(212.))
+            .flex_none()
+            .h_full()
+            .py_3()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .bg(rgb(C::PANEL))
+            .border_r_1()
+            .border_color(rgb(C::BORDER))
+            .overflow_y_scroll()
+            .children(Segment::ALL.iter().filter_map(|&seg| {
+                let tools: Vec<Tool> = Tool::ALL
+                    .into_iter()
+                    .filter(|t| t.segment() == seg)
+                    .collect();
+                if tools.is_empty() {
+                    return None;
+                }
+                Some(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .px_4()
+                                .pb_1()
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(rgb(C::MUTED))
+                                .child(seg.label().to_uppercase()),
+                        )
+                        .children(tools.into_iter().map(|t| {
+                            let active = self.tool == t;
+                            let view = view.clone();
+                            div()
+                                .id(t.slug())
+                                .mx_2()
+                                .px_3()
+                                .py(px(5.))
+                                .rounded_md()
+                                .text_sm()
+                                .whitespace_nowrap()
+                                .cursor_pointer()
+                                .bg(if active {
+                                    rgb(C::SELECT).into()
+                                } else {
+                                    Hsla::transparent_black()
+                                })
+                                .text_color(rgb(if active { C::TEXT } else { 0xb7c0cf }))
+                                .when(active, |d| d.font_weight(gpui::FontWeight::SEMIBOLD))
+                                .hover(|s| s.bg(rgb(C::PANEL2)).text_color(rgb(C::TEXT)))
+                                .child(t.label())
+                                .tooltip(tip(t.describe()))
+                                .on_click(move |_, window, cx| {
+                                    view.update(cx, |this, cx| this.select(t, window, cx)).ok();
+                                })
+                        })),
+                )
+            }))
     }
 
     fn toggle_fullscreen(
@@ -193,7 +208,7 @@ impl Shell {
 
     fn cancel_dialog(&mut self, _: &CancelDialog, window: &mut Window, cx: &mut Context<Self>) {
         self.confirm_quit = false;
-        self.select(self.tab, window, cx);
+        self.select(self.tool, window, cx);
     }
 
     fn quit(&mut self, _: &Quit, _: &mut Window, cx: &mut Context<Self>) {
@@ -230,46 +245,52 @@ impl Shell {
                             .child("Network Analyser"),
                     ),
             )
-            .children(Tab::ALL.iter().enumerate().map(|(i, &t)| {
-                let active = self.tab == t;
-                let view = view.clone();
+            .child(
                 div()
-                    .id(("tab", i))
-                    .h_full()
-                    .px_4()
+                    .id("toggle-sidebar")
+                    .px_2()
+                    .py_1()
+                    .mr_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_color(rgb(C::MUTED))
+                    .hover(|s| s.bg(rgb(C::PANEL2)).text_color(rgb(C::TEXT)))
+                    .child("☰")
+                    .tooltip(tip(if cfg!(target_os = "macos") {
+                        "Show / hide tools (⌘B)"
+                    } else {
+                        "Show / hide tools (Ctrl+B)"
+                    }))
+                    .on_click({
+                        let view = view.clone();
+                        move |_, _, cx| {
+                            view.update(cx, |this, cx| {
+                                this.sidebar = !this.sidebar;
+                                cx.notify();
+                            })
+                            .ok();
+                        }
+                    }),
+            )
+            .child(
+                div()
                     .flex()
                     .items_center()
-                    .border_b_2()
-                    .border_color(if active {
-                        rgb(C::ACCENT).into()
-                    } else {
-                        Hsla::transparent_black()
-                    })
+                    .gap_2()
                     .text_sm()
                     .whitespace_nowrap()
-                    .font_weight(if active {
-                        gpui::FontWeight::SEMIBOLD
-                    } else {
-                        gpui::FontWeight::NORMAL
-                    })
-                    .text_color(rgb(if active { C::TEXT } else { C::MUTED }))
-                    .hover(|s| s.text_color(rgb(C::TEXT)))
-                    .cursor_pointer()
-                    .child(t.label())
-                    .tooltip(crate::widgets::tip(format!(
-                        "{} ({}+{})",
-                        t.label(),
-                        if cfg!(target_os = "macos") {
-                            "⌘"
-                        } else {
-                            "Alt"
-                        },
-                        i + 1
-                    )))
-                    .on_click(move |_, window, cx| {
-                        view.update(cx, |this, cx| this.select(t, window, cx)).ok();
-                    })
-            }))
+                    .child(
+                        div()
+                            .text_color(rgb(C::MUTED))
+                            .child(self.tool.segment().label()),
+                    )
+                    .child(div().text_color(rgb(C::MUTED)).child("›"))
+                    .child(
+                        div()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(self.tool.label()),
+                    ),
+            )
             .child(div().flex_1())
             .child(self.render_update_button(cx))
             .child(div().w(px(8.)))
@@ -682,8 +703,6 @@ impl Focusable for Shell {
 
 impl Render for Shell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let tab =
-            |t: Tab| cx.listener(move |this: &mut Self, _: &Tab1, w, cx| this.select(t, w, cx));
         div()
             .key_context(if self.confirm_quit {
                 "QuitDialog"
@@ -695,11 +714,12 @@ impl Render for Shell {
             .on_action(cx.listener(Self::request_quit))
             .on_action(cx.listener(Self::cancel_dialog))
             .on_action(cx.listener(Self::quit))
-            .on_action(tab(Tab::Lan))
-            .on_action(cx.listener(|this, _: &Tab2, w, cx| this.select(Tab::Ports, w, cx)))
-            .on_action(cx.listener(|this, _: &Tab3, w, cx| this.select(Tab::Capture, w, cx)))
-            .on_action(cx.listener(|this, _: &Tab4, w, cx| this.select(Tab::Serial, w, cx)))
-            .on_action(cx.listener(|this, _: &Tab5, w, cx| this.select(Tab::Modbus, w, cx)))
+            .on_action(cx.listener(|this, _: &PrevTool, w, cx| this.step_tool(-1, w, cx)))
+            .on_action(cx.listener(|this, _: &NextTool, w, cx| this.step_tool(1, w, cx)))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
+                this.sidebar = !this.sidebar;
+                cx.notify();
+            }))
             .relative()
             .flex()
             .flex_col()
@@ -710,10 +730,19 @@ impl Render for Shell {
             .child(
                 div()
                     .flex()
-                    .flex_col()
+                    .flex_row()
                     .flex_1()
                     .min_h_0()
-                    .child(self.active_view()),
+                    .when(self.sidebar, |d| d.child(self.render_sidebar(cx)))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .child(self.active_view()),
+                    ),
             )
             .when(self.update_dialog, |d| {
                 d.child(self.render_update_dialog(cx))

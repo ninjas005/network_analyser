@@ -490,3 +490,144 @@ pub fn input<V: 'static>(
     .detach();
     e
 }
+
+// ---------------------------------------------------------------- text area
+
+/// Emitted whenever a [`TextArea`]'s text changes.
+pub struct Changed;
+
+/// Multi-line plain-text editor with the cursor at the end: typing,
+/// Enter (newline), Backspace, Ctrl+V paste, Ctrl+C copy all, Ctrl+U clear.
+pub struct TextArea {
+    pub focus: FocusHandle,
+    pub value: String,
+    placeholder: SharedString,
+    height: f32,
+    max_len: usize,
+}
+
+impl EventEmitter<Changed> for TextArea {}
+
+impl TextArea {
+    pub fn new(cx: &mut Context<Self>, placeholder: impl Into<SharedString>, height: f32) -> Self {
+        Self {
+            focus: cx.focus_handle(),
+            value: String::new(),
+            placeholder: placeholder.into(),
+            height,
+            max_len: 1 << 20,
+        }
+    }
+
+    pub fn set(&mut self, v: impl Into<String>, cx: &mut Context<Self>) {
+        self.value = v.into();
+        cx.emit(Changed);
+        cx.notify();
+    }
+
+    fn on_key(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        let cmd = ks.modifiers.control || ks.modifiers.platform;
+        match ks.key.as_str() {
+            "backspace" if cmd => self.value.clear(),
+            "backspace" => {
+                self.value.pop();
+            }
+            "enter" => self.value.push('\n'),
+            "tab" => self.value.push('\t'),
+            "u" if cmd => self.value.clear(),
+            "v" if cmd => {
+                if let Some(t) = cx.read_from_clipboard().and_then(|c| c.text()) {
+                    let room = self.max_len.saturating_sub(self.value.len());
+                    self.value
+                        .extend(t.replace("\r\n", "\n").chars().take(room));
+                }
+            }
+            "c" if cmd => {
+                cx.write_to_clipboard(ClipboardItem::new_string(self.value.clone()));
+                cx.stop_propagation();
+                return;
+            }
+            _ => {
+                if ks.modifiers.control || ks.modifiers.alt || ks.modifiers.platform {
+                    return;
+                }
+                match ks.key_char.as_deref() {
+                    Some(c)
+                        if self.value.len() < self.max_len
+                            && !c.chars().any(|ch| ch.is_control()) =>
+                    {
+                        self.value.push_str(c)
+                    }
+                    _ => return,
+                }
+            }
+        }
+        cx.emit(Changed);
+        cx.stop_propagation();
+        cx.notify();
+    }
+}
+
+impl Render for TextArea {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let focused = self.focus.is_focused(window);
+        let empty = self.value.is_empty();
+        // Very long inputs: render only the tail to keep layout cheap.
+        let shown: String = if self.value.len() > 64 * 1024 {
+            format!(
+                "… ({} bytes)\n{}",
+                self.value.len(),
+                &self.value[self.value.floor_char_boundary(self.value.len() - 32 * 1024)..]
+            )
+        } else {
+            self.value.clone()
+        };
+        let lines: Vec<String> = shown.split('\n').map(String::from).collect();
+        let last = lines.len().saturating_sub(1);
+        div()
+            .id("text-area")
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(Self::on_key))
+            .on_click(cx.listener(|this, _, window, _| window.focus(&this.focus)))
+            .h(px(self.height))
+            .w_full()
+            .p_2()
+            .overflow_y_scroll()
+            .rounded_md()
+            .bg(rgb(C::BG))
+            .border_1()
+            .border_color(rgb(if focused { C::ACCENT } else { C::BORDER }))
+            .cursor_text()
+            .text_sm()
+            .font_family(mono())
+            .when(empty && !focused, |d| {
+                d.text_color(rgb(C::MUTED)).child(self.placeholder.clone())
+            })
+            .when(!empty || focused, |d| {
+                d.text_color(rgb(C::TEXT))
+                    .children(lines.into_iter().enumerate().map(|(i, l)| {
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .min_h(px(18.))
+                            .child(div().child(l))
+                            .when(focused && i == last, |d| {
+                                d.child(div().w(px(1.5)).h(px(16.)).ml(px(1.)).bg(rgb(C::ACCENT)))
+                            })
+                    }))
+            })
+    }
+}
+
+/// A read-only value with a Copy button (for results).
+pub fn copy_button(id: impl Into<gpui::ElementId>, text: String) -> gpui::Stateful<gpui::Div> {
+    chip(id, "Copy", false, move |_, _, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()))
+    })
+}
+
+/// Green / amber / red / muted dot.
+pub fn dot(color: u32) -> impl IntoElement {
+    div().size(px(8.)).flex_none().rounded_full().bg(rgb(color))
+}
