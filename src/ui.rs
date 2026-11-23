@@ -1,52 +1,21 @@
-//! GPUI front-end: toolbar, host table, detail panel, status bar, quit dialog.
+//! LAN scan tab: toolbar, host table, detail panel, status bar.
 
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, ClickEvent, Context, FocusHandle, Focusable, Hsla, KeyDownEvent, MouseButton, Rgba,
-    SharedString, Task, UniformListScrollHandle, Window, actions, div, prelude::*, px, rgb,
-    uniform_list,
+    App, ClickEvent, Context, FocusHandle, Focusable, Hsla, KeyDownEvent, SharedString, Task,
+    UniformListScrollHandle, Window, actions, div, prelude::*, px, rgb, uniform_list,
 };
 
 use crate::netinfo::{self, LocalIface};
 use crate::scanner::{self, HostInfo, ScanConfig, ScanEvent, ScanHandle, Status};
+use crate::widgets::{C, Tip, cell, section_title};
 
 actions!(
     network_analyser,
-    [
-        Quit,
-        RequestQuit,
-        CancelDialog,
-        ToggleFullscreen,
-        StartStop,
-        ToggleFilter,
-        Export,
-        FocusSearch,
-        ClearSearch
-    ]
+    [StartStop, ToggleFilter, Export, FocusSearch, ClearSearch]
 );
-
-// ---------------------------------------------------------------- palette
-
-struct C;
-#[allow(dead_code)]
-impl C {
-    const BG: u32 = 0x0f1218;
-    const PANEL: u32 = 0x161b24;
-    const PANEL2: u32 = 0x1c2230;
-    const ROW_ALT: u32 = 0x131821;
-    const BORDER: u32 = 0x262e3d;
-    const TEXT: u32 = 0xe4e8ef;
-    const MUTED: u32 = 0x8a94a6;
-    const ACCENT: u32 = 0x4c8dff;
-    const ACCENT_HOVER: u32 = 0x6aa1ff;
-    const GREEN: u32 = 0x3ccf7e;
-    const AMBER: u32 = 0xf2b84b;
-    const RED: u32 = 0xef5a5a;
-    const RED_HOVER: u32 = 0xff7070;
-    const SELECT: u32 = 0x23324f;
-}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Filter {
@@ -73,7 +42,6 @@ pub struct ScannerView {
     scan_started: Option<Instant>,
     last_elapsed: Option<Duration>,
     status_msg: SharedString,
-    confirm_quit: bool,
     intercepted: Vec<u16>,
     list_scroll: UniformListScrollHandle,
     _poll: Option<Task<()>>,
@@ -108,15 +76,10 @@ impl ScannerView {
             scan_started: None,
             last_elapsed: None,
             status_msg: status_msg.into(),
-            confirm_quit: false,
             intercepted: Vec::new(),
             list_scroll: UniformListScrollHandle::new(),
             _poll: None,
         }
-    }
-
-    pub fn focus_handle_ref(&self) -> &FocusHandle {
-        &self.focus
     }
 
     fn scanning(&self) -> bool {
@@ -268,33 +231,11 @@ impl ScannerView {
         cx.notify();
     }
 
-    fn toggle_fullscreen(
-        &mut self,
-        _: &ToggleFullscreen,
-        window: &mut Window,
-        _: &mut Context<Self>,
-    ) {
-        // In kiosk mode the window must stay fullscreen.
-        if !self.kiosk {
-            window.toggle_fullscreen();
-        }
-    }
-
-    fn request_quit(&mut self, _: &RequestQuit, _: &mut Window, cx: &mut Context<Self>) {
-        self.confirm_quit = !self.confirm_quit;
-        cx.notify();
-    }
-
-    fn cancel_dialog(&mut self, _: &CancelDialog, _: &mut Window, cx: &mut Context<Self>) {
-        self.confirm_quit = false;
-        cx.notify();
-    }
-
-    fn quit(&mut self, _: &Quit, _: &mut Window, cx: &mut Context<Self>) {
+    /// Stop any running scan (app is quitting).
+    pub fn cancel(&self) {
         if let Some(s) = &self.scan {
             s.cancel();
         }
-        cx.quit();
     }
 
     fn export(&mut self, _: &Export, _: &mut Window, cx: &mut Context<Self>) {
@@ -485,28 +426,6 @@ impl ScannerView {
 
     // ------------------------------------------------------------ render helpers
 
-    fn button(
-        id: &'static str,
-        label: impl Into<SharedString>,
-        bg: u32,
-        hover: u32,
-        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    ) -> impl IntoElement {
-        div()
-            .id(id)
-            .px_4()
-            .py(px(7.))
-            .rounded_md()
-            .bg(rgb(bg))
-            .hover(move |s| s.bg(rgb(hover)))
-            .cursor_pointer()
-            .text_sm()
-            .font_weight(gpui::FontWeight::SEMIBOLD)
-            .text_color(rgb(C::TEXT))
-            .child(label.into())
-            .on_click(on_click)
-    }
-
     fn render_toolbar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused = self.input_focus.is_focused(window);
         let scanning = self.scanning();
@@ -549,7 +468,7 @@ impl ScannerView {
         let iface_btn = self.iface.as_ref().map(|i| {
             let cidr = i.cidr();
             let label = format!("⟲ {}", i.name);
-            Self::button("iface", label, C::PANEL2, C::BORDER, {
+            crate::widgets::button("iface", label, C::PANEL2, C::BORDER, {
                 let view = cx.entity().downgrade();
                 move |_, _, cx| {
                     let cidr = cidr.clone();
@@ -573,29 +492,11 @@ impl ScannerView {
             .bg(rgb(C::PANEL))
             .border_b_1()
             .border_color(rgb(C::BORDER))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().size(px(12.)).rounded_full().bg(rgb(if scanning {
-                        C::AMBER
-                    } else {
-                        C::GREEN
-                    })))
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .child("Network Analyser"),
-                    ),
-            )
-            .child(div().w(px(16.)))
             .child(div().text_sm().text_color(rgb(C::MUTED)).child("Range"))
             .child(input)
             .children(iface_btn)
             .child(if scanning {
-                Self::button(
+                crate::widgets::button(
                     "start",
                     "■ Stop",
                     C::AMBER,
@@ -604,7 +505,7 @@ impl ScannerView {
                 )
                 .into_any_element()
             } else {
-                Self::button(
+                crate::widgets::button(
                     "start",
                     "▶ Scan",
                     C::ACCENT,
@@ -620,7 +521,7 @@ impl ScannerView {
             )
             .child(div().flex_1())
             .child(self.render_search(window, cx))
-            .child(Self::button(
+            .child(crate::widgets::button(
                 "filter",
                 if self.filter == Filter::Alive {
                     "Showing: live hosts"
@@ -631,19 +532,12 @@ impl ScannerView {
                 C::BORDER,
                 act(|t, w, cx| t.toggle_filter(&ToggleFilter, w, cx)),
             ))
-            .child(Self::button(
+            .child(crate::widgets::button(
                 "export",
                 "Export CSV",
                 C::PANEL2,
                 C::BORDER,
                 act(|t, w, cx| t.export(&Export, w, cx)),
-            ))
-            .child(Self::button(
-                "quit",
-                "✕ Quit",
-                C::RED,
-                C::RED_HOVER,
-                act(|t, w, cx| t.request_quit(&RequestQuit, w, cx)),
             ))
     }
 
@@ -1049,95 +943,6 @@ impl ScannerView {
             .child(div().flex_1())
             .child(keys)
     }
-
-    fn render_quit_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let view = cx.entity().downgrade();
-        let view2 = view.clone();
-        div()
-            .id("quit-overlay")
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(Hsla::from(Rgba {
-                r: 0.,
-                g: 0.,
-                b: 0.,
-                a: 0.6,
-            }))
-            .occlude()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.confirm_quit = false;
-                    cx.notify();
-                }),
-            )
-            .child(
-                div()
-                    .id("quit-dialog")
-                    .w(px(400.))
-                    .p_6()
-                    .flex()
-                    .flex_col()
-                    .gap_4()
-                    .rounded_lg()
-                    .bg(rgb(C::PANEL))
-                    .border_1()
-                    .border_color(rgb(C::BORDER))
-                    .shadow_lg()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .child("Quit Network Analyser?"),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(C::MUTED))
-                            .child(if self.scanning() {
-                                "A scan is in progress and will be stopped."
-                            } else {
-                                "Any results not exported will be lost."
-                            }),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .justify_end()
-                            .gap_2()
-                            .child(Self::button(
-                                "quit-cancel",
-                                "Cancel (Esc)",
-                                C::PANEL2,
-                                C::BORDER,
-                                move |_, _, cx| {
-                                    view.update(cx, |this, cx| {
-                                        this.confirm_quit = false;
-                                        cx.notify();
-                                    })
-                                    .ok();
-                                },
-                            ))
-                            .child(Self::button(
-                                "quit-confirm",
-                                "Quit (Enter)",
-                                C::RED,
-                                C::RED_HOVER,
-                                move |_, window, cx| {
-                                    view2
-                                        .update(cx, |this, cx| this.quit(&Quit, window, cx))
-                                        .ok();
-                                },
-                            )),
-                    ),
-            )
-    }
 }
 
 const COLUMNS: [(&str, f32); 10] = [
@@ -1152,28 +957,6 @@ const COLUMNS: [(&str, f32); 10] = [
     ("OS GUESS", 190.),
     ("OPEN PORTS", 0.), // 0 = flexible
 ];
-
-/// A fixed-width table cell whose text is cut with an ellipsis.
-/// (gpui 0.2's own `text_ellipsis` caches the unconstrained measurement in
-/// flex rows, so the cut is done here from an average glyph width.)
-fn cell(w: f32, text: impl Into<SharedString>) -> gpui::Div {
-    let text: SharedString = text.into();
-    let d = div().pr_3().overflow_hidden().whitespace_nowrap();
-    if w == 0.0 {
-        return d.flex_1().min_w(px(120.)).child(text);
-    }
-    let max = ((w - 14.) / 7.4).max(3.) as usize;
-    let text: SharedString = if text.chars().count() > max {
-        format!(
-            "{}…",
-            text.chars().take(max - 1).collect::<String>().trim_end()
-        )
-        .into()
-    } else {
-        text
-    };
-    d.w(px(w)).flex_none().child(text)
-}
 
 /// Case-insensitive match against everything shown for a host. Every
 /// whitespace-separated term must match (e.g. "raspberry 22").
@@ -1243,15 +1026,6 @@ fn sort_value(h: &HostInfo, col: usize) -> Option<SortVal> {
     }
 }
 
-fn section_title(t: &str) -> impl IntoElement {
-    div()
-        .text_xs()
-        .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(rgb(C::ACCENT))
-        .pb_1()
-        .child(t.to_uppercase())
-}
-
 fn status_color(s: Status) -> (Hsla, &'static str) {
     match s {
         Status::Pending => (rgb(0x3a4252).into(), "pending"),
@@ -1280,28 +1054,16 @@ impl Focusable for ScannerView {
 
 impl Render for ScannerView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let context = if self.confirm_quit {
-            "QuitDialog"
-        } else {
-            "Scanner"
-        };
         div()
-            .key_context(context)
+            .key_context("Scanner")
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::start_stop))
             .on_action(cx.listener(Self::toggle_filter))
-            .on_action(cx.listener(Self::toggle_fullscreen))
-            .on_action(cx.listener(Self::request_quit))
-            .on_action(cx.listener(Self::cancel_dialog))
-            .on_action(cx.listener(Self::quit))
             .on_action(cx.listener(Self::export))
             .on_action(cx.listener(Self::focus_search))
-            .relative()
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(C::BG))
-            .text_color(rgb(C::TEXT))
             .child(self.render_toolbar(window, cx))
             .child(
                 div()
@@ -1313,24 +1075,6 @@ impl Render for ScannerView {
                     .children(self.selected.map(|i| self.render_details(i, cx))),
             )
             .child(self.render_status_bar())
-            .when(self.confirm_quit, |d| d.child(self.render_quit_dialog(cx)))
-    }
-}
-
-struct Tip(SharedString);
-
-impl Render for Tip {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .max_w(px(420.))
-            .p_2()
-            .rounded_md()
-            .bg(rgb(C::PANEL2))
-            .border_1()
-            .border_color(rgb(C::BORDER))
-            .text_xs()
-            .text_color(rgb(C::TEXT))
-            .child(self.0.clone())
     }
 }
 

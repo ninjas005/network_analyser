@@ -41,4 +41,7 @@ echo "Installed Network Analyser to $prefix"
 echo "  binary: $bin"
 echo "  menu:   Network Analyser (normal, kiosk and windowed entries)"
 command -v ping >/dev/null 2>&1 || echo "note: install 'iputils-ping' (or your distro's ping) for ICMP results"
+echo "packet capture needs libpcap and raw-socket rights:"
+echo "  sudo setcap cap_net_raw,cap_net_admin=eip $bin"
+echo "serial / Modbus RTU needs access to /dev/tty*: sudo usermod -aG dialout \$USER (then log in again)"
 case ":$PATH:" in *":$prefix/bin:"*) ;; *) echo "note: $prefix/bin is not on your PATH" ;; esac

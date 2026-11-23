@@ -185,6 +185,14 @@ jobs:
       - uses: actions/download-artifact@v4
         with: { name: oui, path: assets }
       - uses: dtolnay/rust-toolchain@stable
+      - name: Npcap SDK (wpcap.lib for linking; Npcap itself is a runtime install)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri https://npcap.com/dist/npcap-sdk-1.13.zip -OutFile npcap-sdk.zip
+          Expand-Archive npcap-sdk.zip -DestinationPath npcap-sdk
+          "LIBPCAP_LIBDIR=$((Resolve-Path npcap-sdk/Lib/x64).Path)" >> $env:GITHUB_ENV
+          "LIBPCAP_VER=1.10.0" >> $env:GITHUB_ENV
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --release --locked

@@ -9,5 +9,12 @@ fn main() {
             println!("cargo:warning=could not embed Windows icon: {e}");
         }
     }
+    // Packet capture uses Npcap's wpcap.dll. Delay-load it so the app still
+    // starts without Npcap installed (capture::available() checks for it and
+    // the capture tab explains how to install it).
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rustc-link-arg=/DELAYLOAD:wpcap.dll");
+        println!("cargo:rustc-link-lib=delayimp");
+    }
     println!("cargo:rerun-if-changed=assets/icon.ico");
 }

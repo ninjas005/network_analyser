@@ -65,4 +65,12 @@ Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
 
 [Run]
+; Packet capture needs Npcap (separate licence, so it is not bundled).
+Filename: "https://npcap.com/#download"; Description: "Download Npcap (needed for the Packet Capture tab)"; Flags: shellexec postinstall skipifsilent unchecked nowait; Check: not NpcapInstalled
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
+
+[Code]
+function NpcapInstalled: Boolean;
+begin
+  Result := FileExists(ExpandConstant('{sys}\Npcap\wpcap.dll')) or FileExists(ExpandConstant('{sys}\wpcap.dll'));
+end;

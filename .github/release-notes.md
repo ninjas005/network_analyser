@@ -18,6 +18,8 @@
 
 **Windows:** the installer and exe are unsigned, so SmartScreen may warn. Click **More info → Run anyway**. Users without admin rights can choose *Install for me only*.
 
+**Packet capture** needs raw-socket rights. Linux: `sudo setcap cap_net_raw,cap_net_admin=eip $(command -v network_analyser)`. macOS: access to `/dev/bpf*` (Wireshark's ChmodBPF) or `sudo`. Windows: install [Npcap](https://npcap.com/#download); everything else works without it. Serial ports on Linux need the `dialout` group.
+
 ## Usage
 
 ```
@@ -26,6 +28,10 @@ network_analyser --kiosk        # locked fullscreen, no window decorations
 network_analyser --windowed     # normal window
 network_analyser --scan         # start scanning the local subnet on launch
 network_analyser --cli [RANGE]  # headless scan to stdout
+network_analyser --tab capture  # open on a tab: lan, ports, capture, serial, modbus
+network_analyser --portscan example.com top   # headless port scan
 ```
+
+Tabs: **LAN Scan**, **Port Scan** (domains / IPs / ranges), **Packet Capture** (live or .pcap, with analysis), **Serial** (monitor, send, Modbus RTU decode, baud detection) and **Modbus** (TCP/RTU master, polling, writes, discovery). Switch with Alt+1…5.
 
 Quit: **✕ Quit** button, **Esc** (confirm with Enter), or **Ctrl+Q** (**⌘Q** on macOS).

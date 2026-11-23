@@ -1,9 +1,20 @@
 # Network Analyser
 
-A lightweight LAN scanner with a GPUI interface. It finds the live devices
-on a network and collects whatever it can about each one. No root needed.
+A lightweight network and fieldbus toolkit with a GPUI interface, organised in tabs:
 
-## What it collects per host
+| Tab | What it does |
+|---|---|
+| **LAN Scan** | Finds the live devices on a network and collects whatever it can about each one (no root needed) |
+| **Port Scan** | TCP connect scan of domain names, IPv4/IPv6 addresses and ranges, with service banners and HTTP titles |
+| **Packet Capture** | Live capture (libpcap / Npcap) or `.pcap`/`.pcapng` files: packet list, layer details, hex dump, traffic analysis |
+| **Serial** | Lists serial ports, connects with any line settings, monitors as text / hex / decoded Modbus RTU, sends data, detects the baud rate |
+| **Modbus** | Modbus TCP and RTU master: read/poll/write coils and registers, unit-ID and TCP server discovery, device identification, decoded traffic |
+
+Switch tabs with a click or **Alt+1…5** (**⌘1…5** on macOS).
+
+## LAN Scan
+
+What it collects per host:
 
 | Info | Source |
 |---|---|
@@ -21,39 +32,265 @@ TEST-NET addresses (RFC 5737). If ports "open" there, a transparent proxy or sec
 agent is answering for every address. Those ports are excluded and a warning appears in
 the status bar.
 
+## Port Scan
+
+Targets can be mixed and comma/space separated: `example.com, 10.0.0.5, 10.0.0.0/28, 2001:db8::1`.
+A domain name is resolved and its first IPv4 and first IPv6 address are scanned.
+Ports: `top` (≈120 common services), ranges and lists (`1-1024,3389,8000-8100`), or the
+presets *Top ports*, *1-1024*, *Industrial* (Modbus 502, S7 102, OPC UA 4840, IEC-104 2404,
+DNP3 20000, EtherNet/IP 44818, BACnet 47808, MQTT…) and *All 65535*. Open ports get a banner
+(SSH/FTP/SMTP greeting, HTTP status, `Server` and `<title>`); port 502 is asked for its Modbus
+device identification. Results export to `~/port-scan-<timestamp>.csv`.
+
+Only scan hosts you own or are authorised to test.
+
+## Packet Capture
+
+- Pick an interface (the one with the default route is preselected), optionally a BPF
+  capture filter (`tcp port 502`, `host 10.0.0.5`, `not arp`), and press **Start**.
+  *Promiscuous* captures frames for other hosts too; *Save to .pcap* writes everything to
+  `~/capture-<timestamp>.pcap` while capturing.
+- Or type the path of a `.pcap` / `.pcapng` file and press **Open .pcap**.
+- The display filter matches protocol, addresses, ports and the info column; every term must
+  match and `!term` excludes (`modbus 10.0.0.20`, `!arp !mdns`). **Save shown as .pcap** writes
+  the filtered packets.
+- Click a packet for its decoded layers and hex dump. Decoded: Ethernet/VLAN/LLC, Linux
+  cooked, loopback, raw IP, ARP, IPv4/IPv6, ICMP/ICMPv6, IGMP, TCP, UDP, DNS/mDNS/LLMNR, DHCP,
+  NTP, SSDP, NBNS, HTTP, TLS (with SNI), SSH, MQTT, SNMP, QUIC and **Modbus/TCP** (function,
+  addresses, values, exceptions).
+- **Analysis**: totals, rate and throughput, protocol breakdown, top talkers and
+  conversations.
+
+**Permissions.** Capturing needs raw-socket rights:
+
+| OS | Setup |
+|---|---|
+| Linux | `sudo setcap cap_net_raw,cap_net_admin=eip $(command -v network_analyser)` once (or run as root) |
+| macOS | Access to `/dev/bpf*`, e.g. Wireshark's *ChmodBPF* helper, or run with `sudo` |
+| Windows | Install [Npcap](https://npcap.com/#download) (the installer offers the link). Without Npcap everything except capture still works |
+
+## Serial
+
+Ports are listed with their USB VID:PID, manufacturer and serial number. Choose baud, data
+bits, parity, stop bits and RTS/CTS, then **Connect**. Received bytes are grouped into frames
+by silence on the line (*Frame gap*, automatically 3.5 character times in Modbus view) and
+shown as **Text**, **Hex** or decoded **Modbus RTU** with CRC check, plus RX/TX byte counts,
+frame and CRC-error statistics. Send text (with `\r \n \xNN` escapes and a line ending) or
+hex (optionally with the Modbus CRC appended). **Detect baud** listens at each standard rate
+and scores readable text and valid Modbus frames (the device must be transmitting).
+**Save log** writes a hex/ASCII/decoded log to `~/serial-log-<timestamp>.txt`.
+
+On Linux, add yourself to the `dialout` group to open serial ports:
+`sudo usermod -aG dialout $USER`, then log in again.
+
+## Modbus
+
+- **Modbus TCP** (host, port 502) or **Modbus RTU** (serial port and line settings; 8E1 is the
+  Modbus default), unit ID and timeout.
+- **Read** coils (FC1), discrete inputs (FC2), holding registers (FC3) or input registers (FC4)
+  once, or **Poll** at an interval. Values show their 0-based address and 1-based reference
+  (`40001`…), formatted as UInt16, Int16, hex, binary, Float32 or UInt32 (with word swap).
+  Click a row to use its address for writing.
+- **Write** a single coil/register (FC5/FC6) or several (FC15/FC16): `123`, `-5`, `0x1F`,
+  `1,2,3`; coils take `1/0` or `on/off`.
+- **Discover**: scan unit IDs on the current link (an RTU bus or a TCP gateway), read device
+  identification (FC43/14), or find Modbus TCP servers in an IP range.
+- **Traffic** shows every frame in hex with its decoding, and the status bar counts requests,
+  exceptions, errors and the average response time.
+
 ## Install
 
-Download from [Releases](../../releases):
+Download the file for your system from the [Releases](../../releases) page. Every release also
+has a `SHA256SUMS.txt`. To check a download, run `sha256sum -c SHA256SUMS.txt --ignore-missing`
+on Linux, `shasum -a 256 <file>` on macOS, or `Get-FileHash <file>` in Windows PowerShell.
 
-| Platform | Package |
+| System | File |
 |---|---|
-| Debian / Ubuntu | `network-analyser_<ver>_amd64.deb` → `sudo apt install ./network-analyser_*.deb` |
-| Fedora / RHEL / openSUSE | `network-analyser-<ver>-1.x86_64.rpm` → `sudo dnf install ./network-analyser-*.rpm` |
-| Other Linux (glibc 2.35+) | `network-analyser-<ver>-linux-x86_64.tar.gz` → `./install.sh` (user) or `sudo ./install.sh` |
-| macOS 11+ (Apple Silicon + Intel) | `network-analyser-<ver>-macos-universal.dmg` |
-| Windows 10/11 x64 | `network-analyser-<ver>-windows-x86_64-setup.exe` (installer) or `…-windows-x86_64.zip` (portable) |
+| Debian, Ubuntu, Mint, Pop!_OS | `network-analyser_<version>_amd64.deb` |
+| Fedora, RHEL, Rocky/Alma, openSUSE | `network-analyser-<version>-1.x86_64.rpm` |
+| Any other Linux (Arch, Manjaro, Void…; glibc 2.35+) | `network-analyser-<version>-linux-x86_64.tar.gz` |
+| macOS 11+ (Apple Silicon and Intel) | `network-analyser-<version>-macos-universal.dmg` |
+| Windows 10/11 x64 (installer) | `network-analyser-<version>-windows-x86_64-setup.exe` |
+| Windows 10/11 x64 (portable) | `network-analyser-<version>-windows-x86_64.zip` |
 
-**Linux display servers:** one binary supports both **Wayland** and **X11**. It uses
-Wayland when `WAYLAND_DISPLAY` is set and X11 otherwise. `--x11` forces X11 (XWayland
-under a Wayland session) and `--wayland` forces native Wayland. A Vulkan driver is
-required (Mesa's `mesa-vulkan-drivers` covers Intel/AMD and software rendering).
+The LAN Scan, Port Scan and Modbus TCP tabs work right after installing. **Packet Capture** and
+**Serial / Modbus RTU** need the one-time permission steps listed for your system below.
 
-**macOS:** the app is ad-hoc signed but not notarized. On first launch, right-click → Open
-(or `xattr -dr com.apple.quarantine "/Applications/Network Analyser.app"`), then allow
-*Local Network* access.
+### Linux: Debian / Ubuntu / Mint / Pop!_OS
 
-**Windows:** unsigned, so SmartScreen may warn: click *More info → Run anyway*.
-`--cli` output appears in the console it was started from.
+1. Install the package. apt pulls in libpcap, ping and the graphics libraries automatically:
+   ```sh
+   sudo apt install ./network-analyser_*_amd64.deb
+   ```
+2. Allow packet capture without root (needed only for the Packet Capture tab):
+   ```sh
+   sudo setcap cap_net_raw,cap_net_admin=eip /usr/bin/network_analyser
+   ```
+3. Allow serial-port access (Serial and Modbus RTU tabs), then **log out and back in**:
+   ```sh
+   sudo usermod -aG dialout $USER
+   ```
+4. Start **Network Analyser** from the applications menu (normal, kiosk and windowed entries),
+   or run `network_analyser` in a terminal.
+
+To uninstall, run `sudo apt remove network-analyser`.
+
+### Linux: Fedora / RHEL / Rocky / Alma / openSUSE
+
+1. Install the package:
+   ```sh
+   sudo dnf install ./network-analyser-*.x86_64.rpm      # Fedora, RHEL, Rocky, Alma
+   sudo zypper install ./network-analyser-*.x86_64.rpm   # openSUSE
+   ```
+2. Allow packet capture: `sudo setcap cap_net_raw,cap_net_admin=eip /usr/bin/network_analyser`
+3. Allow serial-port access, then log out and back in: `sudo usermod -aG dialout $USER`
+4. Start it from the applications menu or with `network_analyser`.
+
+To uninstall, run `sudo dnf remove network-analyser` (or `sudo zypper remove network-analyser`).
+
+### Linux: any other distribution (tarball)
+
+1. Install the runtime libraries if they are missing: libpcap, a Vulkan driver (Mesa),
+   libxkbcommon, Wayland/X11 client libraries and `ping`. For example:
+   ```sh
+   sudo pacman -S --needed libpcap vulkan-icd-loader mesa libxkbcommon-x11 wayland iputils   # Arch / Manjaro
+   ```
+2. Extract the archive and run the installer:
+   ```sh
+   tar xzf network-analyser-*-linux-x86_64.tar.gz
+   cd network-analyser-*-linux-x86_64
+   ./install.sh          # for your user only, into ~/.local
+   sudo ./install.sh     # or system-wide, into /usr/local
+   ```
+3. Allow packet capture. The path is the one `install.sh` printed:
+   ```sh
+   sudo setcap cap_net_raw,cap_net_admin=eip ~/.local/bin/network_analyser
+   ```
+4. Allow serial-port access, then log out and back in. The group is `uucp` on Arch-based
+   systems and `dialout` elsewhere:
+   ```sh
+   sudo usermod -aG uucp $USER      # Arch / Manjaro
+   sudo usermod -aG dialout $USER   # most others
+   ```
+
+To uninstall, run `./install.sh --uninstall` (with `sudo` for a system-wide install).
+
+**Linux notes**
+- One binary supports both **Wayland** and **X11**. It uses Wayland when `WAYLAND_DISPLAY` is
+  set and X11 otherwise. `--x11` forces X11 (XWayland under a Wayland session) and
+  `--wayland` forces native Wayland.
+- A Vulkan driver is required. Mesa (`mesa-vulkan-drivers` on Debian/Ubuntu/Fedora) covers
+  Intel, AMD and software rendering. On NVIDIA, use the proprietary driver.
+- Rebuilding or replacing the binary drops the `setcap` rights; run the command again.
+
+### macOS 11+ (Apple Silicon and Intel)
+
+1. Open the `.dmg` and drag **Network Analyser** into **Applications**.
+2. The app is ad-hoc signed but not notarized, so on first launch right-click it → **Open** →
+   **Open**. Alternatively, remove the quarantine flag once:
+   ```sh
+   xattr -dr com.apple.quarantine "/Applications/Network Analyser.app"
+   ```
+3. When asked, allow **Local Network** access. You can change this later in System Settings →
+   Privacy & Security → Local Network. Without it, scans find nothing.
+4. **Packet capture** needs read access to `/dev/bpf*`. The easiest way is to install
+   [Wireshark](https://www.wireshark.org/download.html) and run its **Install ChmodBPF**
+   package, which grants access to the `access_bpf` group at every boot. A temporary
+   alternative until the next reboot is `sudo chmod o+r /dev/bpf*`. libpcap itself ships with macOS.
+5. **Serial ports** need no extra permission. USB adapters appear as
+   `/dev/cu.usbserial-*` or `/dev/cu.usbmodem*`. Adapters with CH340/CH341 or older
+   Prolific chips may need the vendor's macOS driver; FTDI and CP210x work out of the box on
+   recent macOS.
+6. To run with command-line options:
+   ```sh
+   "/Applications/Network Analyser.app/Contents/MacOS/network_analyser" --windowed
+   ```
+
+To uninstall, move the app from Applications to the Trash.
+
+### Windows 10 / 11 (x64)
+
+**Installer (recommended)**
+
+1. Run `network-analyser-<version>-windows-x86_64-setup.exe`. It is unsigned, so SmartScreen
+   may warn: click **More info → Run anyway**.
+2. Choose *Install for all users* (needs admin) or *Install for me only*.
+3. On the last page, tick **Download Npcap** if you want the Packet Capture tab; the option
+   only appears when Npcap is missing.
+4. Start it from the Start menu: **Network Analyser**, **(Kiosk, scan on start)** or
+   **(Windowed)**.
+
+To uninstall, use Settings → Apps → Installed apps → Network Analyser → Uninstall.
+
+**Portable zip:** extract it anywhere and run `network_analyser.exe`. Keep `oui.txt` next to
+the exe for MAC-vendor names.
+
+**Packet capture (Npcap):**
+1. Download and run the installer from <https://npcap.com/#download>.
+2. Keep the defaults. Leave **"Restrict Npcap driver's access to Administrators only"**
+   unticked; otherwise start Network Analyser as administrator.
+3. Restart Network Analyser. Without Npcap every other tab still works, and the capture tab
+   shows a short message instead.
+
+**Serial ports:** USB adapters appear as `COM3`, `COM4`, and so on (see Device Manager → Ports
+(COM & LPT)). Windows installs drivers for FTDI and most CP210x adapters automatically. For
+CH340/CH341 or Prolific PL2303, install the driver from the chip vendor. A COM port can be open
+in only one program at a time.
+
+**Command line:** `--cli` and `--portscan` output appears in the console you started it from:
+```powershell
+& "$env:ProgramFiles\Network Analyser\network_analyser.exe" --portscan example.com top
+```
+If you chose *Install for me only*, the path is under `%LOCALAPPDATA%\Programs` instead.
 
 ## Build from source
 
+Install Rust with [rustup](https://rustup.rs) (stable toolchain) on every platform, then follow
+the steps for your OS.
+
+**Debian / Ubuntu**
 ```sh
-# Debian/Ubuntu build dependencies (same list CI uses)
-./.github/linux-deps.sh
+./.github/linux-deps.sh          # same build dependencies CI uses (includes libpcap-dev)
+cargo build --release
+./target/release/network_analyser --windowed
+```
+
+**Fedora**
+```sh
+sudo dnf install gcc clang pkg-config libxkbcommon-devel libxkbcommon-x11-devel \
+  libxcb-devel libX11-devel wayland-devel wayland-protocols-devel vulkan-loader-devel \
+  fontconfig-devel freetype-devel libzstd-devel openssl-devel libpcap-devel
 cargo build --release
 ```
 
-macOS needs Xcode command-line tools; Windows needs the MSVC toolchain.
+**Arch**
+```sh
+sudo pacman -S --needed base-devel clang libxkbcommon-x11 libxcb wayland wayland-protocols \
+  vulkan-icd-loader fontconfig freetype2 zstd openssl libpcap
+cargo build --release
+```
+
+**macOS**
+```sh
+xcode-select --install           # compilers; libpcap ships with macOS
+cargo build --release
+```
+
+**Windows**
+1. Install [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+   with the **Desktop development with C++** workload, then rustup.
+2. Download the [Npcap SDK](https://npcap.com/#download) and extract it, e.g. to `C:\npcap-sdk`.
+3. Build in PowerShell:
+   ```powershell
+   $env:LIBPCAP_LIBDIR = "C:\npcap-sdk\Lib\x64"
+   $env:LIBPCAP_VER = "1.10.0"
+   cargo build --release
+   ```
+   The Npcap SDK is needed only for linking. `wpcap.dll` is delay-loaded, so the exe also runs on
+   machines without Npcap.
+
+Run the tests with `cargo test`. Serial and Modbus RTU tests use pseudo-terminals on Unix; the
+capture test is skipped when Npcap is not installed.
 
 ## Releasing
 
@@ -62,7 +299,7 @@ for every push and PR. To publish a release:
 
 ```sh
 # bump `version` in Cargo.toml first, commit, then:
-git tag v0.1.0 && git push origin v0.1.0
+git tag v1.0.0 && git push origin v1.0.0
 ```
 
 `.github/workflows/release.yml` refreshes the MAC-vendor list, builds the
@@ -78,6 +315,10 @@ network_analyser --kiosk        # locked fullscreen, no decorations, F11 disable
 network_analyser --windowed     # normal window
 network_analyser --kiosk --scan # start scanning the local subnet on launch
 network_analyser --cli [RANGE]  # headless, prints a table
+network_analyser --tab modbus   # open on a tab: lan, ports, capture, serial, modbus
+network_analyser --portscan example.com,10.0.0.0/30 top,8000-8100   # headless port scan
+network_analyser --list-ifaces  # capture interfaces
+network_analyser --list-serial  # serial ports
 network_analyser --update-oui   # refresh MAC-vendor DB (curl) -> ~/.local/share/network_analyser/oui.txt
 ```
 
@@ -85,9 +326,13 @@ Ranges: `192.168.1.0/24` (/16–/32), `10.0.0.5-40`, `10.0.0.5-10.0.1.9`, or a s
 
 ## Keys
 
+Text boxes: Enter runs the box's action (scan, connect, read, send…), Ctrl+U clears,
+Ctrl+V pastes.
+
 | Key | Action |
 |---|---|
-| F5 / Ctrl+R / Enter in range box | Start / stop scan |
+| Alt+1…5 (⌘1…5 on macOS) | Switch tab |
+| F5 / Ctrl+R / Enter in range box | Start / stop LAN scan |
 | Ctrl+F | Focus search (Esc clears it, Esc again leaves the box) |
 | F6 | Toggle live-only / all addresses |
 | Ctrl+E | Export CSV to `~/network-scan-<timestamp>.csv` |
@@ -105,13 +350,19 @@ match, so `raspberry 22` finds Raspberry Pis with SSH open.
 
 ## Layout
 
-- `src/main.rs` – CLI flags, window/kiosk setup, key bindings, headless mode
-- `src/ui.rs` – GPUI view (toolbar, table, details, status bar, quit dialog)
+- `src/main.rs` – CLI flags, window/kiosk setup, key bindings, headless modes
+- `src/shell.rs` – root view: tab bar, quit dialog
+- `src/widgets.rs` – palette, buttons, chips, text input, table cells
+- `src/ui.rs` – LAN Scan tab (toolbar, table, details, status bar)
+- `src/portscan.rs`, `src/portscan_view.rs` – remote TCP port scanner and its tab
+- `src/capture.rs`, `src/dissect.rs`, `src/capture_view.rs` – pcap capture thread, packet dissector, capture/analysis tab
+- `src/serial.rs`, `src/serial_view.rs` – serial enumeration, monitor thread, baud detection, Serial tab
+- `src/modbus.rs`, `src/modbus_view.rs` – Modbus RTU/TCP framing, CRC, master thread, scans, passive decoder, Modbus tab
 - `src/scanner.rs` – scan engine (own thread + tokio), fingerprinting
 - `src/probes.rs` – ping, TCP, banners/HTTP, mDNS, NetBIOS, SSDP/UPnP, rDNS
 - `src/netinfo.rs` – interfaces, OUI vendors, ranges, port names
 - `src/platform.rs` – per-OS gateway / ARP / MAC / directories (Linux `/proc`, macOS & Windows `route`/`arp`/`ifconfig`/`ipconfig`)
-- `build.rs` – embeds the icon into the Windows `.exe`
+- `build.rs` – embeds the icon into the Windows `.exe`, delay-loads Npcap's `wpcap.dll`
 - `assets/` – icon (PNG/ICO), `.desktop` file
 
 `libc` is pinned to 0.2.186 (and tokio to 1.52) in `Cargo.lock`. Newer `libc` removed

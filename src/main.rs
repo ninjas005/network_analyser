@@ -1,11 +1,22 @@
 // Windows: GUI app without a console window (see attach_parent_console).
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod capture;
+mod capture_view;
+mod dissect;
+mod modbus;
+mod modbus_view;
 mod netinfo;
 mod platform;
+mod portscan;
+mod portscan_view;
 mod probes;
 mod scanner;
+mod serial;
+mod serial_view;
+mod shell;
 mod ui;
+mod widgets;
 
 use std::time::Duration;
 
@@ -14,17 +25,18 @@ use gpui::{
     WindowDecorations, WindowKind, WindowOptions, point, px, size,
 };
 
-use ui::{
-    CancelDialog, ClearSearch, Export, FocusSearch, Quit, RequestQuit, ScannerView, StartStop,
-    ToggleFilter, ToggleFullscreen,
+use shell::{
+    CancelDialog, Quit, RequestQuit, Shell, Tab, Tab1, Tab2, Tab3, Tab4, Tab5, ToggleFullscreen,
 };
+use ui::{ClearSearch, Export, FocusSearch, ScannerView, StartStop, ToggleFilter};
 
 const USAGE: &str = "\
-network_analyser - lightweight LAN scanner
+network_analyser - LAN scanner, port scanner, packet capture, serial and Modbus tool
 
 USAGE:
-    network_analyser [--kiosk | --windowed] [--scan]
+    network_analyser [--kiosk | --windowed] [--scan] [--tab TAB]
     network_analyser --cli [RANGE]
+    network_analyser --portscan TARGETS [PORTS]
 
 OPTIONS:
     (default)     Open fullscreen; F11 toggles fullscreen
@@ -32,11 +44,17 @@ OPTIONS:
                   the Quit button, Esc (with confirmation) or Ctrl+Q
     --windowed    Open in a normal window (development)
     --scan        Start scanning the local subnet immediately
+    --tab TAB     Open on a tab: lan, ports, capture, serial, modbus
     --x11         Linux: force X11 (XWayland under a Wayland session)
     --wayland     Linux: force native Wayland
     --cli RANGE   Headless scan, print results to stdout
-    --update-oui  Download the latest IEEE MAC-vendor list (needs curl)
                   RANGE: 192.168.1.0/24 | 10.0.0.5-40 | 10.0.0.5-10.0.1.9
+    --portscan TARGETS [PORTS]
+                  Headless TCP port scan of domains / IPs / ranges, e.g.
+                  --portscan example.com,10.0.0.0/30 top,8000-8100
+    --list-ifaces List packet-capture interfaces
+    --list-serial List serial ports
+    --update-oui  Download the latest IEEE MAC-vendor list (needs curl)
 ";
 
 #[derive(PartialEq)]
@@ -54,6 +72,7 @@ fn main() {
     }
     let mut mode = Mode::Fullscreen;
     let mut autoscan = false;
+    let mut tab = Tab::Lan;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -68,7 +87,56 @@ fn main() {
                     std::process::exit(2);
                 }
             }
+            "--tab" => {
+                i += 1;
+                tab = args.get(i).and_then(|t| Tab::parse(t)).unwrap_or_else(|| {
+                    eprintln!("--tab: expected lan, ports, capture, serial or modbus");
+                    std::process::exit(2)
+                });
+            }
             "--cli" => return run_cli(args.get(i + 1).cloned()),
+            "--portscan" => {
+                let Some(targets) = args.get(i + 1).cloned() else {
+                    eprintln!("--portscan: missing TARGETS\n\n{USAGE}");
+                    std::process::exit(2)
+                };
+                return run_portscan(targets, args.get(i + 2).cloned());
+            }
+            "--list-ifaces" => {
+                match capture::interfaces() {
+                    Ok(list) => {
+                        for i in list {
+                            println!(
+                                "{:<20} {:<5} {:<40} {}",
+                                i.name,
+                                if i.up { "up" } else { "down" },
+                                i.addrs.join(", "),
+                                i.desc
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("{e}");
+                        std::process::exit(1)
+                    }
+                }
+                return;
+            }
+            "--list-serial" => {
+                match serial::list_ports() {
+                    Ok(list) if list.is_empty() => eprintln!("no serial ports found"),
+                    Ok(list) => {
+                        for p in list {
+                            println!("{:<24} {:<9} {}", p.name, p.kind, p.detail);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("{e}");
+                        std::process::exit(1)
+                    }
+                }
+                return;
+            }
             "--update-oui" => {
                 return match netinfo::update_oui_db() {
                     Ok(p) => println!("MAC vendor database saved to {}", p.display()),
@@ -86,10 +154,10 @@ fn main() {
         }
         i += 1;
     }
-    run_gui(mode, autoscan);
+    run_gui(mode, autoscan, tab);
 }
 
-fn run_gui(mode: Mode, autoscan: bool) {
+fn run_gui(mode: Mode, autoscan: bool, tab: Tab) {
     let kiosk = mode == Mode::Kiosk;
     Application::new().run(move |cx: &mut App| {
         cx.bind_keys([
@@ -98,8 +166,18 @@ fn run_gui(mode: Mode, autoscan: bool) {
             KeyBinding::new("secondary-r", StartStop, Some("Scanner")),
             KeyBinding::new("f6", ToggleFilter, Some("Scanner")),
             KeyBinding::new("secondary-e", Export, Some("Scanner")),
-            KeyBinding::new("f11", ToggleFullscreen, Some("Scanner")),
-            KeyBinding::new("escape", RequestQuit, Some("Scanner")),
+            KeyBinding::new("f11", ToggleFullscreen, Some("Shell")),
+            KeyBinding::new("escape", RequestQuit, Some("Shell")),
+            KeyBinding::new("alt-1", Tab1, Some("Shell")),
+            KeyBinding::new("alt-2", Tab2, Some("Shell")),
+            KeyBinding::new("alt-3", Tab3, Some("Shell")),
+            KeyBinding::new("alt-4", Tab4, Some("Shell")),
+            KeyBinding::new("alt-5", Tab5, Some("Shell")),
+            KeyBinding::new("cmd-1", Tab1, Some("Shell")),
+            KeyBinding::new("cmd-2", Tab2, Some("Shell")),
+            KeyBinding::new("cmd-3", Tab3, Some("Shell")),
+            KeyBinding::new("cmd-4", Tab4, Some("Shell")),
+            KeyBinding::new("cmd-5", Tab5, Some("Shell")),
             KeyBinding::new("escape", CancelDialog, Some("QuitDialog")),
             KeyBinding::new("enter", Quit, Some("QuitDialog")),
             KeyBinding::new("secondary-f", FocusSearch, Some("Scanner")),
@@ -146,15 +224,18 @@ fn run_gui(mode: Mode, autoscan: bool) {
                     ..Default::default()
                 },
                 |window, cx| {
-                    let view = cx.new(|cx| {
+                    let lan = cx.new(|cx| {
                         let mut v = ScannerView::new(kiosk, cx);
                         if autoscan {
                             v.start_scan(cx);
                         }
                         v
                     });
-                    window.focus(&view.read(cx).focus_handle_ref().clone());
-                    view
+                    cx.new(|cx| {
+                        let mut shell = Shell::new(kiosk, lan, cx);
+                        shell.select(tab, window, cx);
+                        shell
+                    })
                 },
             )
             .expect("failed to open window");
@@ -247,6 +328,72 @@ fn run_cli(range: Option<String>) {
                     alive.len(),
                     elapsed.as_secs_f32()
                 );
+                break;
+            }
+        }
+    }
+}
+
+fn run_portscan(targets: String, ports: Option<String>) {
+    let ports = portscan::parse_ports(ports.as_deref().unwrap_or("top")).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2)
+    });
+    eprintln!("Scanning {} ports on {targets}…", ports.len());
+    let handle = portscan::start(portscan::PortScanConfig {
+        targets,
+        ports,
+        timeout: Duration::from_millis(1500),
+        concurrency: 400,
+        banners: true,
+    });
+    let mut names = Vec::new();
+    let mut open: Vec<portscan::OpenPort> = Vec::new();
+    while let Ok(ev) = handle.events.recv() {
+        match ev {
+            portscan::PortScanEvent::Resolved(t) => {
+                for x in &t {
+                    eprintln!("  {} -> {}", x.name, x.ip);
+                }
+                names = t;
+            }
+            portscan::PortScanEvent::Open(p) => open.push(p),
+            portscan::PortScanEvent::Banner {
+                target,
+                port,
+                banner,
+            } => {
+                if let Some(p) = open
+                    .iter_mut()
+                    .find(|p| p.target == target && p.port == port)
+                {
+                    p.banner = banner.text;
+                    p.http_title = banner.http_title;
+                }
+            }
+            portscan::PortScanEvent::Progress { .. } => {}
+            portscan::PortScanEvent::Error(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1)
+            }
+            portscan::PortScanEvent::Finished { elapsed, .. } => {
+                open.sort_by_key(|p| (p.target, p.port));
+                for p in &open {
+                    let t = &names[p.target];
+                    println!(
+                        "{:<40} {:>5}/tcp {:<12} {:>7.1}ms  {}{}",
+                        format!("{} ({})", t.name, t.ip),
+                        p.port,
+                        p.service,
+                        p.connect_ms,
+                        p.banner.clone().unwrap_or_default(),
+                        p.http_title
+                            .as_ref()
+                            .map(|t| format!("  [{t}]"))
+                            .unwrap_or_default()
+                    );
+                }
+                eprintln!("{} open ports in {:.1}s", open.len(), elapsed.as_secs_f32());
                 break;
             }
         }

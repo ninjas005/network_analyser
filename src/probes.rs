@@ -1,7 +1,7 @@
 //! Small, dependency-free protocol probes used to enrich a live host.
 //! Everything here is unprivileged (plain TCP/UDP sockets).
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -89,6 +89,12 @@ pub struct Banner {
 /// Read whatever the service says first; if it is silent and the port looks
 /// like HTTP, send a minimal GET and extract status / Server / <title>.
 pub async fn grab_banner(ip: Ipv4Addr, port: u16, http_hint: bool) -> Banner {
+    grab_banner_at(IpAddr::V4(ip), port, &ip.to_string(), http_hint).await
+}
+
+/// `host` goes into the HTTP Host header (a domain name selects the right
+/// virtual host on remote servers).
+pub async fn grab_banner_at(ip: IpAddr, port: u16, host: &str, http_hint: bool) -> Banner {
     let mut out = Banner::default();
     let addr = SocketAddr::from((ip, port));
     let Ok(Ok(mut s)) = timeout(Duration::from_millis(1200), TcpStream::connect(addr)).await else {
@@ -103,7 +109,7 @@ pub async fn grab_banner(ip: Ipv4Addr, port: u16, http_hint: bool) -> Banner {
         return out;
     }
     let req = format!(
-        "GET / HTTP/1.0\r\nHost: {ip}\r\nUser-Agent: Mozilla/5.0 (network-analyser)\r\nAccept: */*\r\n\r\n"
+        "GET / HTTP/1.0\r\nHost: {host}\r\nUser-Agent: Mozilla/5.0 (network-analyser)\r\nAccept: */*\r\n\r\n"
     );
     if s.write_all(req.as_bytes()).await.is_err() {
         return out;
