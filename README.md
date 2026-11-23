@@ -243,6 +243,26 @@ in only one program at a time.
 ```
 If you chose *Install for me only*, the path is under `%LOCALAPPDATA%\Programs` instead.
 
+## Updates
+
+A few seconds after starting, the app checks GitHub for a newer release; the header shows
+**v1.0.1 · Check for updates**, **Up to date ✓** or a green **⬆ Update to x.y.z** button.
+The button opens the release notes and **Update now**, which downloads the right file for
+how the app was installed, verifies it against the release's `SHA256SUMS.txt`, installs it
+and restarts the app with the same options:
+
+| Installed with | What *Update now* does |
+|---|---|
+| Windows installer | Runs the new setup silently (UAC prompt for an all-users install); it restarts the app |
+| Windows zip | Replaces `network_analyser.exe` next to the old one |
+| macOS `.dmg` | Replaces `/Applications/Network Analyser.app` |
+| `.deb` / `.rpm` | Installs the new package through `pkexec` (password prompt) and keeps packet-capture rights |
+| Linux tarball | Replaces the binary (password prompt only for a system-wide install) and keeps packet-capture rights |
+| Built from source | Shows the release page instead |
+
+Turn the automatic check off with `--no-update-check` or `NETWORK_ANALYSER_NO_UPDATE_CHECK=1`
+(useful for kiosks); `network_analyser --check-update` checks from the command line.
+
 ## Build from source
 
 Install Rust with [rustup](https://rustup.rs) (stable toolchain) on every platform, then follow
@@ -299,7 +319,7 @@ for every push and PR. To publish a release:
 
 ```sh
 # bump `version` in Cargo.toml first, commit, then:
-git tag v1.0.0 && git push origin v1.0.0
+git tag v1.0.1 && git push origin v1.0.1
 ```
 
 `.github/workflows/release.yml` refreshes the MAC-vendor list, builds the

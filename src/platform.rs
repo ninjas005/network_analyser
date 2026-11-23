@@ -265,6 +265,32 @@ pub fn bundled_oui_paths() -> Vec<PathBuf> {
     v
 }
 
+/// pcap depends on windows-sys 0.36, whose catch-all `windows.lib` maps
+/// `WaitOnAddress` / `WakeByAddress*` to vertdll.dll (the VBS-enclave
+/// runtime). If the linker resolves std's thread-parking imports from that
+/// library, any thread that parks crashes with an access violation. These
+/// references come from this crate's own object file, which the linker
+/// processes before every library, so the symbols bind to the real
+/// `synchronization.lib` (api-ms-win-core-synch) first and std reuses them.
+#[cfg(all(windows, target_env = "msvc"))]
+mod sync_imports {
+    use std::ffi::c_void;
+
+    #[link(name = "synchronization")]
+    unsafe extern "system" {
+        fn WaitOnAddress(addr: *const c_void, compare: *const c_void, size: usize, ms: u32) -> i32;
+        fn WakeByAddressSingle(addr: *const c_void);
+        fn WakeByAddressAll(addr: *const c_void);
+    }
+
+    #[used]
+    static KEEP_WAKE: [unsafe extern "system" fn(*const c_void); 2] =
+        [WakeByAddressSingle, WakeByAddressAll];
+    #[used]
+    static KEEP_WAIT: unsafe extern "system" fn(*const c_void, *const c_void, usize, u32) -> i32 =
+        WaitOnAddress;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

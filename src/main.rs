@@ -16,6 +16,7 @@ mod serial;
 mod serial_view;
 mod shell;
 mod ui;
+mod updater;
 mod widgets;
 
 use std::time::Duration;
@@ -45,6 +46,9 @@ OPTIONS:
     --windowed    Open in a normal window (development)
     --scan        Start scanning the local subnet immediately
     --tab TAB     Open on a tab: lan, ports, capture, serial, modbus
+    --no-update-check
+                  Don't look for a new release on start (also:
+                  NETWORK_ANALYSER_NO_UPDATE_CHECK=1)
     --x11         Linux: force X11 (XWayland under a Wayland session)
     --wayland     Linux: force native Wayland
     --cli RANGE   Headless scan, print results to stdout
@@ -52,6 +56,8 @@ OPTIONS:
     --portscan TARGETS [PORTS]
                   Headless TCP port scan of domains / IPs / ranges, e.g.
                   --portscan example.com,10.0.0.0/30 top,8000-8100
+    --check-update
+                  Print whether a newer release is available
     --list-ifaces List packet-capture interfaces
     --list-serial List serial ports
     --update-oui  Download the latest IEEE MAC-vendor list (needs curl)
@@ -73,6 +79,7 @@ fn main() {
     let mut mode = Mode::Fullscreen;
     let mut autoscan = false;
     let mut tab = Tab::Lan;
+    let mut update_check = std::env::var_os("NETWORK_ANALYSER_NO_UPDATE_CHECK").is_none();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -94,6 +101,8 @@ fn main() {
                     std::process::exit(2)
                 });
             }
+            "--no-update-check" => update_check = false,
+            "--check-update" => return run_check_update(),
             "--cli" => return run_cli(args.get(i + 1).cloned()),
             "--portscan" => {
                 let Some(targets) = args.get(i + 1).cloned() else {
@@ -154,10 +163,28 @@ fn main() {
         }
         i += 1;
     }
-    run_gui(mode, autoscan, tab);
+    run_gui(mode, autoscan, tab, update_check);
 }
 
-fn run_gui(mode: Mode, autoscan: bool, tab: Tab) {
+fn run_check_update() {
+    println!("current version: {}", updater::CURRENT);
+    println!("install type:    {:?}", updater::install_kind());
+    match updater::check() {
+        Ok(Some(r)) => {
+            println!("update available: {} ({})", r.version, r.page);
+            for a in &r.assets {
+                println!("  {} ({} bytes)", a.name, a.size);
+            }
+        }
+        Ok(None) => println!("up to date"),
+        Err(e) => {
+            eprintln!("update check failed: {e}");
+            std::process::exit(1)
+        }
+    }
+}
+
+fn run_gui(mode: Mode, autoscan: bool, tab: Tab, update_check: bool) {
     let kiosk = mode == Mode::Kiosk;
     Application::new().run(move |cx: &mut App| {
         cx.bind_keys([
@@ -232,7 +259,7 @@ fn run_gui(mode: Mode, autoscan: bool, tab: Tab) {
                         v
                     });
                     cx.new(|cx| {
-                        let mut shell = Shell::new(kiosk, lan, cx);
+                        let mut shell = Shell::new(kiosk, lan, update_check, cx);
                         shell.select(tab, window, cx);
                         shell
                     })

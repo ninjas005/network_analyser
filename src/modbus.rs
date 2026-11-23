@@ -1378,7 +1378,8 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    // macOS ptys reject serial ioctls ("Not a typewriter").
+    #[cfg(target_os = "linux")]
     #[test]
     fn rtu_master_over_pty() {
         use serialport::SerialPort;

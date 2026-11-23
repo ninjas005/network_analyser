@@ -436,7 +436,8 @@ mod tests {
         assert_eq!(s.summary(), "9600 8E1");
     }
 
-    #[cfg(unix)]
+    // macOS ptys reject serial ioctls ("Not a typewriter").
+    #[cfg(target_os = "linux")]
     #[test]
     fn monitor_over_pty() {
         let (mut dev, host) = serialport::TTYPort::pair().expect("pty pair");

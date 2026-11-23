@@ -345,29 +345,38 @@ pub fn write_pcap(
 /// without Npcap the rest of the app keeps working.
 #[cfg(windows)]
 pub mod win {
+    use std::path::PathBuf;
     use std::sync::OnceLock;
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn SetDllDirectoryW(path: *const u16) -> i32;
-        fn LoadLibraryW(name: *const u16) -> isize;
-        fn GetSystemDirectoryW(buf: *mut u16, len: u32) -> u32;
     }
 
-    fn wide(s: &str) -> Vec<u16> {
-        s.encode_utf16().chain(std::iter::once(0)).collect()
+    fn system32() -> PathBuf {
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        PathBuf::from(root).join("System32")
     }
 
+    /// True if Npcap (or WinPcap-compatible wpcap.dll) is installed. Only
+    /// file checks unless it is, so machines without Npcap never touch the
+    /// delay-loaded DLL.
     pub fn npcap_loaded() -> bool {
         static OK: OnceLock<bool> = OnceLock::new();
-        *OK.get_or_init(|| unsafe {
-            let mut buf = [0u16; 260];
-            let n = GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) as usize;
-            if n > 0 && n < buf.len() {
-                let dir = format!("{}\\Npcap", String::from_utf16_lossy(&buf[..n]));
-                SetDllDirectoryW(wide(&dir).as_ptr());
+        *OK.get_or_init(|| {
+            let npcap = system32().join("Npcap");
+            if npcap.join("wpcap.dll").is_file() {
+                let wide: Vec<u16> = npcap
+                    .as_os_str()
+                    .to_string_lossy()
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect();
+                // SAFETY: NUL-terminated UTF-16 path that outlives the call.
+                unsafe { SetDllDirectoryW(wide.as_ptr()) };
+                return true;
             }
-            LoadLibraryW(wide("wpcap.dll").as_ptr()) != 0
+            system32().join("wpcap.dll").is_file()
         })
     }
 }

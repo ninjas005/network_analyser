@@ -1,6 +1,6 @@
 [package]
 name = "network_analyser"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 description = "LAN scanner, remote port scanner, packet capture/analyser, serial monitor and Modbus RTU/TCP tool"
 license = "MIT"
@@ -17,7 +17,9 @@ futures = "0.3.34"
 gpui = { version = "0.2.2", default-features = false, features = ["font-kit", "wayland", "x11", "windows-manifest"] }
 if-addrs = "0.15.0"
 pcap = "2"
+serde_json = "1.0.154"
 serialport = { version = "4", default-features = false }
+sha2 = "0.10.9"
 tokio = { version = "1.52", features = ["rt-multi-thread", "net", "time", "process", "sync", "io-util", "macros"] }
 
 # macOS: compile Metal shaders at runtime so builds don't need Xcode's

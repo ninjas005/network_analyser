@@ -3315,14 +3315,16 @@ dependencies = [
 
 [[package]]
 name = "network_analyser"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "dns-lookup",
  "futures",
  "gpui",
  "if-addrs",
  "pcap",
+ "serde_json",
  "serialport",
+ "sha2 0.10.9",
  "tokio",
  "winresource",
 ]

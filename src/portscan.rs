@@ -128,8 +128,9 @@ pub fn resolve_targets(input: &str) -> Result<Vec<Target>, String> {
                 });
             }
         } else {
-            let mut ips: Vec<IpAddr> = dns_lookup::lookup_host(item)
+            let mut ips: Vec<IpAddr> = std::net::ToSocketAddrs::to_socket_addrs(&(item, 0u16))
                 .map_err(|e| format!("cannot resolve '{item}': {e}"))?
+                .map(|a| a.ip())
                 .collect();
             ips.sort_by_key(|ip| ip.is_ipv6());
             ips.dedup();

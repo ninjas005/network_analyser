@@ -68,8 +68,16 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopico
 ; Packet capture needs Npcap (separate licence, so it is not bundled).
 Filename: "https://npcap.com/#download"; Description: "Download Npcap (needed for the Packet Capture tab)"; Flags: shellexec postinstall skipifsilent unchecked nowait; Check: not NpcapInstalled
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
+; In-app updates run setup with /SILENT /relaunch=1: start the new version afterwards,
+; as the signed-in user rather than elevated.
+Filename: "{app}\{#AppExe}"; Flags: nowait runasoriginaluser; Check: RelaunchAfterUpdate
 
 [Code]
+function RelaunchAfterUpdate: Boolean;
+begin
+  Result := WizardSilent and (ExpandConstant('{param:relaunch|0}') = '1');
+end;
+
 function NpcapInstalled: Boolean;
 begin
   Result := FileExists(ExpandConstant('{sys}\Npcap\wpcap.dll')) or FileExists(ExpandConstant('{sys}\wpcap.dll'));
