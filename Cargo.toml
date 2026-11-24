@@ -1,6 +1,6 @@
 [package]
 name = "network_analyser"
-version = "1.4.0"
+version = "1.5.0"
 edition = "2024"
 description = "LAN scanner, remote port scanner, packet capture/analyser, serial monitor and Modbus RTU/TCP tool"
 license = "MIT"
@@ -13,6 +13,7 @@ build = "build.rs"
 aes = "0.9.4"
 base64 = "0.22.1"
 dns-lookup = "4.0.2"
+flate2 = "1.1"
 futures = "0.3.34"
 getrandom = "0.4.3"
 # Linux: both the X11 and the Wayland backend are compiled in; the backend is

@@ -1,27 +1,33 @@
-//! Packet Capture tab: live capture (libpcap/Npcap) or .pcap file, packet
-//! list with display filter, layer details + hex dump, and traffic analysis
-//! (protocol hierarchy, top talkers, conversations).
+//! Packet list tools on the shared capture session: Live Packet Capture,
+//! PCAP / PCAPNG Viewer and Protocol Decoder. Also the source bar shown by
+//! every packet-analysis tool.
 
-use std::collections::HashMap;
-use std::net::IpAddr;
 use std::ops::Range;
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
 
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, ScrollStrategy, SharedString, Task,
-    UniformListScrollHandle, Window, div, prelude::*, px, rgb, uniform_list,
+    App, Context, Entity, FocusHandle, Focusable, ScrollStrategy, SharedString,
+    UniformListScrollHandle, Window, deferred, div, prelude::*, px, rgb, uniform_list,
 };
 
-use crate::capture::{self, CaptureConfig, CaptureEvent, CaptureHandle, Interface, Packet, Source};
-use crate::dissect;
+use crate::dissect::{self, Dissected};
+use crate::session::{self, OpenTool, Session};
+use crate::tools::Tool;
 use crate::widgets::{
-    Accept, C, TextInput, act, alpha, button, button_primary, button2, cell, chip, empty_state,
-    input, kv_row, label, mono, section_title, status_bar, table_header, tip, toolbar,
+    Accept, C, Changed, TextArea, TextInput, act, alpha, button, button_primary, button2, cell,
+    chip, copy_button, dot, empty_state, input, kv_row, label, mono, section_title, status_bar,
+    table_header, tip, toolbar,
 };
 
-/// Packets kept for display; statistics keep counting beyond this.
-const MAX_PACKETS: usize = 200_000;
+/// Narrower columns next to the protocol tree.
+const DECODE_COLS: [(&str, f32); 7] = [
+    ("NO.", 60.),
+    ("TIME", 90.),
+    ("SOURCE", 140.),
+    ("DESTINATION", 140.),
+    ("PROTOCOL", 100.),
+    ("LENGTH", 64.),
+    ("INFO", 0.),
+];
 
 const COLS: [(&str, f32); 7] = [
     ("NO.", 70.),
@@ -33,126 +39,283 @@ const COLS: [(&str, f32); 7] = [
     ("INFO", 0.),
 ];
 
-#[derive(Clone, Copy, PartialEq)]
-enum Mode {
-    Packets,
-    Analysis,
+// ---------------------------------------------------------------- source bar
+
+/// Interface picker, Start / Stop, Open file and what is loaded.
+pub struct SourceBar {
+    session: Entity<Session>,
+    picker: bool,
 }
 
-#[derive(Default)]
-struct Stats {
-    packets: u64,
-    bytes: u64,
-    first: Option<f64>,
-    last: f64,
-    protos: HashMap<String, (u64, u64)>,
-    talkers: HashMap<IpAddr, (u64, u64, u64, u64)>, // tx pkts, tx bytes, rx pkts, rx bytes
-    convs: HashMap<(String, String, &'static str), Conv>,
-}
-
-#[derive(Default)]
-struct Conv {
-    packets: u64,
-    bytes: u64,
-    first: f64,
-    last: f64,
-}
-
-impl Stats {
-    fn add(&mut self, p: &Packet) {
-        let len = p.len as u64;
-        self.packets += 1;
-        self.bytes += len;
-        self.first.get_or_insert(p.ts);
-        self.last = p.ts;
-        let e = self.protos.entry(p.d.proto.clone()).or_default();
-        e.0 += 1;
-        e.1 += len;
-        if let (Some(s), Some(d)) = (p.d.src_ip, p.d.dst_ip) {
-            let t = self.talkers.entry(s).or_default();
-            t.0 += 1;
-            t.1 += len;
-            let t = self.talkers.entry(d).or_default();
-            t.2 += 1;
-            t.3 += len;
-            let ep = |ip: IpAddr, port: Option<u16>| match (ip, port) {
-                (IpAddr::V6(v6), Some(p)) => format!("[{v6}]:{p}"),
-                (ip, Some(p)) => format!("{ip}:{p}"),
-                (ip, None) => ip.to_string(),
-            };
-            let a = ep(s, p.d.src_port);
-            let b = ep(d, p.d.dst_port);
-            // Direction-independent key.
-            let key = if a <= b {
-                (a, b, p.d.transport.unwrap_or("IP"))
-            } else {
-                (b, a, p.d.transport.unwrap_or("IP"))
-            };
-            let c = self.convs.entry(key).or_insert_with(|| Conv {
-                first: p.ts,
-                ..Default::default()
-            });
-            c.packets += 1;
-            c.bytes += len;
-            c.last = p.ts;
+impl SourceBar {
+    pub fn new(cx: &mut Context<Self>) -> Self {
+        let session = Session::shared(cx);
+        cx.observe(&session, |_, _, cx| cx.notify()).detach();
+        SourceBar {
+            session,
+            picker: false,
         }
     }
 
-    fn duration(&self) -> f64 {
-        self.first.map(|f| (self.last - f).max(0.0)).unwrap_or(0.0)
+    fn render_picker(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let view = cx.entity().downgrade();
+        let s = self.session.read(cx);
+        let list = s.ifaces.as_ref().cloned().unwrap_or_default();
+        let current = s.iface;
+        div()
+            .id("iface-list")
+            .absolute()
+            .top(px(36.))
+            .left(px(0.))
+            .w(px(520.))
+            .max_h(px(420.))
+            .overflow_y_scroll()
+            .occlude()
+            .p_1()
+            .rounded_md()
+            .bg(rgb(C::PANEL2))
+            .border_1()
+            .border_color(rgb(C::BORDER))
+            .shadow_lg()
+            .children(list.into_iter().enumerate().map(|(i, f)| {
+                let name = if cfg!(windows) && !f.desc.is_empty() {
+                    f.desc.clone()
+                } else {
+                    f.name.clone()
+                };
+                let mut sub = f.addrs.clone();
+                if !cfg!(windows) && !f.desc.is_empty() {
+                    sub.push(f.desc.clone());
+                }
+                div()
+                    .id(("iface", i))
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(rgb(if current == Some(i) {
+                        C::SELECT
+                    } else {
+                        C::PANEL2
+                    }))
+                    .hover(|s| s.bg(rgb(C::BORDER)))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .items_center()
+                            .child(dot(if f.up { C::GREEN } else { 0x3a4252 }))
+                            .child(div().text_sm().child(name))
+                            .when(f.loopback, |d| d.child(label("loopback"))),
+                    )
+                    .child(label(sub.join(" · ")).pl(px(16.)))
+                    .on_click(act(&view, move |t: &mut Self, _, cx| {
+                        t.picker = false;
+                        t.session.update(cx, |s, cx| {
+                            s.iface = Some(i);
+                            cx.notify();
+                        });
+                    }))
+            }))
     }
 }
 
+impl Render for SourceBar {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity().downgrade();
+        let weak = self.session.downgrade();
+        let s = self.session.read(cx);
+        let running = s.running();
+        let live = s.live();
+        let source = match (s.source.is_empty(), live, s.is_file) {
+            (true, ..) => "Nothing loaded".to_string(),
+            (_, true, _) => format!("Live: {}", s.source),
+            (_, _, true) => {
+                // The full path is in the status bar.
+                let name = std::path::Path::new(&s.source)
+                    .file_name()
+                    .map_or(s.source.clone(), |n| n.to_string_lossy().into_owned());
+                format!("File: {}", clip(&name, 60))
+            }
+            _ if s.a.stats.packets == 0 => "Nothing captured".to_string(),
+            _ => format!("Captured on {}", s.source),
+        };
+        let packets = s.a.stats.packets;
+        let iface = s.iface_label();
+        let iface_button = button2(
+            "iface-pick",
+            format!("{iface}  ▾"),
+            act(&view, |t: &mut Self, _, _| t.picker = !t.picker),
+        )
+        .max_w(px(300.))
+        .overflow_hidden();
+        div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(
+                div()
+                    .relative()
+                    .child(iface_button)
+                    .when(self.picker && !running, |d| {
+                        d.child(deferred(self.render_picker(cx)).with_priority(1))
+                    }),
+            )
+            .child(if live {
+                button(
+                    "cap-start",
+                    "■ Stop",
+                    C::AMBER,
+                    C::AMBER,
+                    act(&weak, |s: &mut Session, _, _| s.stop()),
+                )
+            } else {
+                button_primary(
+                    "cap-start",
+                    "▶ Start capture",
+                    act(&weak, |s: &mut Session, _, cx| s.start_live(cx)),
+                )
+            })
+            .child(button2(
+                "cap-browse",
+                "Open file…",
+                act(&weak, |s: &mut Session, _, cx| s.browse(cx)),
+            ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(rgb(C::MUTED))
+                    .child(dot(if running {
+                        C::GREEN
+                    } else if packets > 0 {
+                        C::ACCENT
+                    } else {
+                        0x3a4252
+                    }))
+                    .child(
+                        div()
+                            .max_w(px(420.))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(source),
+                    )
+                    .when(packets > 0, |d| d.child(format!("{packets} packets"))),
+            )
+    }
+}
+
+/// Error line of the session, shown under the toolbar.
+pub fn error_line(e: &Option<String>) -> Option<gpui::Div> {
+    e.as_ref().map(|e| {
+        div()
+            .px_5()
+            .py_2()
+            .text_sm()
+            .text_color(rgb(C::RED))
+            .bg(alpha(C::RED, 0.08))
+            .children(e.lines().map(|l| div().child(l.to_string())))
+    })
+}
+
+/// Status bar common to the packet tools.
+pub fn session_status(s: &Session) -> gpui::Div {
+    let elapsed = s.started.map(|t| t.elapsed());
+    status_bar()
+        .child(div().text_color(rgb(C::TEXT)).child(s.status.clone()))
+        .child(format!("{} packets", s.a.stats.packets))
+        .child(human_bytes(s.a.stats.bytes))
+        .when_some(s.pcap_stats, |d, (rx, drop, ifd)| {
+            d.child(format!(
+                "kernel: {rx} received, {drop} dropped, {ifd} by interface"
+            ))
+        })
+        .when(s.a.not_kept > 0, |d| {
+            d.child(div().text_color(rgb(C::AMBER)).child(format!(
+                "list full: {} packets counted but not kept",
+                s.a.not_kept
+            )))
+        })
+        .children(elapsed.map(|e| format!("{:.1}s", e.as_secs_f32())))
+}
+
+// ---------------------------------------------------------------- packet list
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Kind {
+    Live,
+    File,
+    Decode,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Pane {
+    Packets,
+    FileInfo,
+    Hex,
+}
+
 pub struct CaptureView {
+    kind: Kind,
     focus: FocusHandle,
-    ifaces: Result<Vec<Interface>, String>,
-    iface: Option<usize>,
-    picker_open: bool,
+    session: Entity<Session>,
+    bar: Entity<SourceBar>,
     bpf: Entity<TextInput>,
     display: Entity<TextInput>,
     file: Entity<TextInput>,
-    promisc: bool,
-    save: bool,
-    handle: Option<CaptureHandle>,
-    packets: Vec<Packet>,
+    limit: Entity<TextInput>,
+    hex: Entity<TextArea>,
+    hex_link: i32,
+    pane: Pane,
+    /// Only packets containing this protocol (Protocol Decoder).
+    proto: Option<&'static str>,
     visible: Vec<usize>,
+    seen: usize,
+    generation: u64,
     selected: Option<usize>,
-    linktype: i32,
-    source: String,
-    stats: Stats,
-    pcap_stats: Option<(u32, u32, u32)>,
-    dropped_ui: u64,
-    mode: Mode,
+    /// Decoded selected packet: (generation, index).
+    detail: Option<((u64, usize), Dissected)>,
     follow: bool,
-    status: SharedString,
-    error: Option<String>,
-    started: Option<Instant>,
     scroll: UniformListScrollHandle,
-    _poll: Option<Task<()>>,
 }
 
 impl CaptureView {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let ifaces = capture::interfaces();
-        // Default to the interface carrying the default route.
-        let primary = crate::netinfo::local_interfaces()
-            .into_iter()
-            .next()
-            .map(|i| i.ip.to_string());
-        let iface = ifaces.as_ref().ok().and_then(|l| {
-            l.iter()
-                .position(|i| primary.as_ref().is_some_and(|p| i.addrs.contains(p)))
-                .or((!l.is_empty()).then_some(0))
-        });
+    pub fn new(kind: Kind, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let session = Session::shared(cx);
+        cx.observe(&session, |t, _, cx| {
+            t.sync(cx);
+            cx.notify();
+        })
+        .detach();
         let bpf = input(
             window,
             cx,
             "",
-            "Capture filter (BPF): tcp port 502, host 10.0.0.5, not arp",
+            "Capture filter (BPF): tcp port 502, not arp",
             Accept::Any,
-            |t| t.width(330.).mono(),
-            |this: &mut Self, _, cx| this.start_live(cx),
+            |t| t.width(330.),
+            |t: &mut Self, _, cx| {
+                if t.kind == Kind::Live {
+                    t.session.update(cx, |s, cx| s.start_live(cx));
+                } else {
+                    t.open_typed(cx);
+                }
+            },
         );
+        cx.observe(&bpf, |t, b, cx| {
+            let v = b.read(cx).value.clone();
+            let live = t.kind == Kind::Live;
+            t.session.update(cx, |s, _| {
+                if live {
+                    s.bpf = v;
+                } else {
+                    s.file_bpf = v;
+                }
+            });
+        })
+        .detach();
         let display = input(
             window,
             cx,
@@ -162,8 +325,8 @@ impl CaptureView {
             |t| t.width(330.),
             |_: &mut Self, _, _| {},
         );
-        cx.observe(&display, |this, _, cx| {
-            this.recompute_visible(cx);
+        cx.observe(&display, |t, _, cx| {
+            t.refilter(cx);
             cx.notify();
         })
         .detach();
@@ -171,218 +334,141 @@ impl CaptureView {
             window,
             cx,
             "",
-            "path/to/file.pcap",
+            "path/to/file.pcap, .pcapng or .gz",
             Accept::Any,
-            |t| t.width(240.),
-            |this: &mut Self, _, cx| this.open_file(cx),
+            |t| t.width(330.).max_len(4096),
+            |t: &mut Self, _, cx| t.open_typed(cx),
         );
-        let status = match &ifaces {
-            Ok(l) => format!(
-                "{} capture interfaces. Pick one and press Start, or open a .pcap file.",
-                l.len()
-            ),
-            Err(e) => format!("Packet capture unavailable: {e}"),
-        };
-        Self {
+        let limit = input(
+            window,
+            cx,
+            "",
+            "Stop after: 1000, 60s, 50MB",
+            Accept::Any,
+            |t| t.width(190.),
+            |t: &mut Self, _, cx| {
+                t.session.update(cx, |s, cx| s.start_live(cx));
+            },
+        );
+        cx.observe(&limit, |t, l, cx| {
+            let parsed = session::parse_limit(&l.read(cx).value);
+            t.session.update(cx, |s, _| {
+                let snaplen = s.limits.snaplen;
+                s.limits = parsed.clone().unwrap_or_default();
+                s.limits.snaplen = snaplen;
+            });
+            let bad = parsed.is_err();
+            if l.read(cx).error != bad {
+                l.update(cx, |l, cx| {
+                    l.error = bad;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+        let hex = cx.new(|cx| {
+            TextArea::new(
+                cx,
+                "Paste a frame as hex or a hex dump (Wireshark, tcpdump -x, xxd, hexdump -C)",
+                180.,
+            )
+        });
+        cx.subscribe(&hex, |_, _, _: &Changed, cx| cx.notify())
+            .detach();
+        let bar = cx.new(SourceBar::new);
+        let mut v = Self {
+            kind,
             focus: cx.focus_handle(),
-            error: ifaces.as_ref().err().cloned(),
-            ifaces,
-            iface,
-            picker_open: false,
+            session,
+            bar,
             bpf,
             display,
             file,
-            promisc: true,
-            save: false,
-            handle: None,
-            packets: Vec::new(),
+            limit,
+            hex,
+            hex_link: 1,
+            pane: Pane::Packets,
+            proto: None,
             visible: Vec::new(),
+            seen: 0,
+            generation: 0,
             selected: None,
-            linktype: 1,
-            source: String::new(),
-            stats: Stats::default(),
-            pcap_stats: None,
-            dropped_ui: 0,
-            mode: Mode::Packets,
-            follow: true,
-            status: status.into(),
-            started: None,
+            detail: None,
+            follow: kind == Kind::Live,
             scroll: UniformListScrollHandle::new(),
-            _poll: None,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.packets.clear();
-        self.visible.clear();
-        self.selected = None;
-        self.stats = Stats::default();
-        self.pcap_stats = None;
-        self.dropped_ui = 0;
-        self.error = None;
-    }
-
-    fn start_live(&mut self, cx: &mut Context<Self>) {
-        if self.handle.is_some() {
-            return;
-        }
-        let Some(iface) = self
-            .iface
-            .and_then(|i| self.ifaces.as_ref().ok()?.get(i).cloned())
-        else {
-            self.error = Some("Select a capture interface first".into());
-            return;
         };
-        let save_to = self.save.then(|| {
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            crate::platform::home_dir()
-                .unwrap_or_else(|| ".".into())
-                .join(format!("capture-{ts}.pcap"))
-        });
-        let cfg = CaptureConfig {
-            source: Source::Live {
-                device: iface.name.clone(),
-                promisc: self.promisc,
-            },
-            filter: self.bpf.read(cx).value.clone(),
-            save_to: save_to.clone(),
-        };
-        self.begin(cfg, cx);
-        self.status = match save_to {
-            Some(p) => format!("Capturing on {} → {}", iface.label(), p.display()),
-            None => format!("Capturing on {}", iface.label()),
-        }
-        .into();
+        v.sync(cx);
+        v
     }
 
-    fn open_file(&mut self, cx: &mut Context<Self>) {
-        if self.handle.is_some() {
-            return;
+    fn cols(&self) -> &'static [(&'static str, f32); 7] {
+        if self.kind == Kind::Decode {
+            &DECODE_COLS
+        } else {
+            &COLS
         }
-        let raw = self
-            .file
-            .read(cx)
-            .value
-            .trim()
-            .trim_matches('"')
-            .to_string();
-        if raw.is_empty() {
-            self.file.update(cx, |t, cx| {
+    }
+
+    fn open_typed(&mut self, cx: &mut Context<Self>) {
+        match session::user_path(&self.file.read(cx).value) {
+            Some(p) => self.session.update(cx, |s, cx| s.open(p, cx)),
+            None => self.file.update(cx, |t, cx| {
                 t.error = true;
-                cx.notify()
-            });
-            return;
-        }
-        let path = match raw.strip_prefix("~/") {
-            Some(rest) => crate::platform::home_dir().unwrap_or_default().join(rest),
-            None => PathBuf::from(&raw),
-        };
-        let cfg = CaptureConfig {
-            source: Source::File(path.clone()),
-            filter: self.bpf.read(cx).value.clone(),
-            save_to: None,
-        };
-        self.begin(cfg, cx);
-        self.status = format!("Reading {}", path.display()).into();
-    }
-
-    fn begin(&mut self, cfg: CaptureConfig, cx: &mut Context<Self>) {
-        self.reset();
-        self.picker_open = false;
-        self.handle = Some(capture::start(cfg));
-        self.started = Some(Instant::now());
-        self._poll = Some(cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(150))
-                    .await;
-                match this.update(cx, |this, cx| this.drain(cx)) {
-                    Ok(true) => {}
-                    _ => break,
-                }
-            }
-        }));
-        cx.notify();
-    }
-
-    fn stop(&mut self) {
-        if let Some(h) = &self.handle {
-            h.stop();
+                cx.notify();
+            }),
         }
     }
 
-    fn drain(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(h) = &self.handle else { return false };
-        let mut stopped = None;
-        let mut new = Vec::new();
-        while let Ok(ev) = h.events.try_recv() {
-            match ev {
-                CaptureEvent::Started { linktype, desc } => {
-                    self.linktype = linktype;
-                    self.source = desc;
-                }
-                CaptureEvent::Packets(p) => new.extend(p),
-                CaptureEvent::Stats {
-                    received,
-                    dropped,
-                    if_dropped,
-                } => self.pcap_stats = Some((received, dropped, if_dropped)),
-                CaptureEvent::InjectFailed(e) => self.error = Some(format!("send failed: {e}")),
-                CaptureEvent::Stopped(err) => stopped = Some(err),
+    /// Take over packets added since the last call.
+    fn sync(&mut self, cx: &mut Context<Self>) {
+        let s = self.session.read(cx);
+        if s.generation != self.generation {
+            self.generation = s.generation;
+            self.visible.clear();
+            self.seen = 0;
+            self.selected = None;
+            self.detail = None;
+            self.proto = None;
+        }
+        let terms = session::filter_terms(&self.display.read(cx).value);
+        let packets = &s.a.packets;
+        let before = self.visible.len();
+        for (i, p) in packets.iter().enumerate().skip(self.seen) {
+            if session::matches(p, &terms) && self.proto.is_none_or(|n| p.d.path.contains(&n)) {
+                self.visible.push(i);
             }
         }
-        if !new.is_empty() {
-            let terms = filter_terms(&self.display.read(cx).value);
-            for p in new {
-                self.stats.add(&p);
-                if self.packets.len() >= MAX_PACKETS {
-                    self.dropped_ui += 1;
-                    continue;
-                }
-                if matches(&p, &terms) {
-                    self.visible.push(self.packets.len());
-                }
-                self.packets.push(p);
+        self.seen = packets.len();
+        if self.follow && s.live() && self.visible.len() > before {
+            self.scroll
+                .scroll_to_item(self.visible.len() - 1, ScrollStrategy::Bottom);
+        }
+        // "Show packet" from another tool.
+        if let Some(i) = s.goto
+            && i < packets.len()
+            && self.kind == Kind::Live
+        {
+            self.session.update(cx, |s, _| s.goto = None);
+            self.pane = Pane::Packets;
+            if !self.visible.contains(&i) {
+                self.display.update(cx, |d, cx| d.set("", cx));
+                self.proto = None;
+                self.refilter(cx);
             }
-            if self.follow && self.mode == Mode::Packets && !self.visible.is_empty() {
-                self.scroll
-                    .scroll_to_item(self.visible.len() - 1, ScrollStrategy::Bottom);
+            self.selected = Some(i);
+            self.follow = false;
+            if let Some(at) = self.visible.iter().position(|v| *v == i) {
+                self.scroll.scroll_to_item(at, ScrollStrategy::Center);
             }
         }
-        let finished = stopped.is_some();
-        if let Some(err) = stopped {
-            self.handle = None;
-            self.started = None;
-            self.status = match &err {
-                Some(e) => {
-                    let hint = capture::permission_hint(e);
-                    self.error = Some(match hint {
-                        Some(h) => format!("{e}\n{h}"),
-                        None => e.clone(),
-                    });
-                    format!("Capture failed: {e}").into()
-                }
-                None => format!(
-                    "Stopped — {} packets, {} from {}",
-                    self.stats.packets,
-                    human_bytes(self.stats.bytes),
-                    self.source
-                )
-                .into(),
-            };
-        }
-        cx.notify();
-        !finished
     }
 
-    fn recompute_visible(&mut self, cx: &App) {
-        let terms = filter_terms(&self.display.read(cx).value);
-        self.visible = (0..self.packets.len())
-            .filter(|&i| matches(&self.packets[i], &terms))
-            .collect();
+    fn refilter(&mut self, cx: &mut Context<Self>) {
+        self.visible.clear();
+        self.seen = 0;
+        let follow = std::mem::replace(&mut self.follow, false);
+        self.sync(cx);
+        self.follow = follow;
         if let Some(sel) = self.selected
             && !self.visible.contains(&sel)
         {
@@ -390,158 +476,160 @@ impl CaptureView {
         }
     }
 
-    fn save_visible(&mut self) {
-        if self.visible.is_empty() {
-            self.status = "Nothing to save".into();
-            return;
-        }
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let path = crate::platform::home_dir()
-            .unwrap_or_else(|| ".".into())
-            .join(format!("packets-{ts}.pcap"));
-        let pkts: Vec<&Packet> = self.visible.iter().map(|&i| &self.packets[i]).collect();
-        self.status = match capture::write_pcap(&path, self.linktype, &pkts) {
-            Ok(()) => format!("Saved {} packets to {}", pkts.len(), path.display()).into(),
-            Err(e) => format!("Save failed: {e}").into(),
+    fn set_proto(&mut self, name: &'static str, cx: &mut Context<Self>) {
+        self.proto = if self.proto == Some(name) {
+            None
+        } else {
+            Some(name)
         };
+        self.refilter(cx);
     }
 
     // ------------------------------------------------------------ rendering
 
-    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let view = cx.entity().downgrade();
-        let running = self.handle.is_some();
-        let iface_label = match (&self.ifaces, self.iface) {
-            (Ok(l), Some(i)) => l.get(i).map(|i| i.label()).unwrap_or_default(),
-            (Ok(_), None) => "Select interface".into(),
-            (Err(_), _) => "Capture unavailable".into(),
-        };
-        div()
-            .flex()
-            .flex_col()
-            .child(
-                toolbar()
-                    .child(label("Interface"))
-                    .child(
-                        button2("iface-pick", format!("{iface_label}  ▾"), act(&view, |t: &mut Self, _, _| t.picker_open = !t.picker_open))
-                            .max_w(px(320.))
-                            .overflow_hidden(),
-                    )
+        let weak = self.session.downgrade();
+        let s = self.session.read(cx);
+        let mut first = toolbar().child(self.bar.clone());
+        match self.kind {
+            Kind::Live => {
+                let headers = s.limits.snaplen.is_some();
+                first = first
                     .child(self.bpf.clone())
-                    .child(chip("promisc", "Promiscuous", self.promisc, act(&view, |t: &mut Self, _, _| t.promisc = !t.promisc)).tooltip(tip("Capture all frames seen by the interface, not only those addressed to this machine.")))
-                    .child(chip("save", "Save to .pcap", self.save, act(&view, |t: &mut Self, _, _| t.save = !t.save)).tooltip(tip("Also write every captured packet to ~/capture-<time>.pcap")))
-                    .child(if running {
-                        button("cap-start", "■ Stop", C::AMBER, C::AMBER, act(&view, |t: &mut Self, _, _| t.stop()))
-                    } else {
-                        button_primary("cap-start", "▶ Start", act(&view, |t: &mut Self, _, cx| t.start_live(cx)))
-                    })
-                    .child(div().w(px(1.)).h(px(24.)).bg(rgb(C::BORDER)))
-                    .child(self.file.clone())
-                    .child(button2("cap-open", "Open .pcap", act(&view, |t: &mut Self, _, cx| t.open_file(cx)))),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_3()
-                    .px_5()
-                    .py_2()
-                    .bg(rgb(C::PANEL))
-                    .border_b_1()
-                    .border_color(rgb(C::BORDER))
-                    .child(chip("mode-pk", "Packets", self.mode == Mode::Packets, act(&view, |t: &mut Self, _, _| t.mode = Mode::Packets)))
-                    .child(chip("mode-an", "Analysis", self.mode == Mode::Analysis, act(&view, |t: &mut Self, _, _| t.mode = Mode::Analysis)))
-                    .child(div().w(px(8.)))
-                    .child(self.display.clone())
-                    .child(chip("follow", "Auto-scroll", self.follow, act(&view, |t: &mut Self, _, _| t.follow = !t.follow)))
-                    .child(div().flex_1())
-                    .child(button2("cap-save", "Save shown as .pcap", act(&view, |t: &mut Self, _, _| t.save_visible())))
-                    .child(button2("cap-clear", "Clear", act(&view, |t: &mut Self, _, _| t.reset()))),
-            )
-    }
-
-    fn render_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let view = cx.entity().downgrade();
-        let list = self.ifaces.as_ref().map(|l| l.as_slice()).unwrap_or(&[]);
-        div()
-            .id("iface-list")
-            .absolute()
-            .top(px(56.))
-            .left(px(90.))
-            .w(px(520.))
-            .max_h(px(420.))
-            .overflow_y_scroll()
-            .p_1()
-            .rounded_md()
-            .bg(rgb(C::PANEL2))
-            .border_1()
-            .border_color(rgb(C::BORDER))
-            .shadow_lg()
-            .children(list.iter().enumerate().map(|(i, f)| {
-                let active = self.iface == Some(i);
-                div()
-                    .id(("iface", i))
-                    .px_3()
-                    .py_2()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .bg(rgb(if active { C::SELECT } else { C::PANEL2 }))
-                    .hover(|s| s.bg(rgb(C::BORDER)))
+                    .child(self.limit.clone())
                     .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .items_center()
-                            .child(div().size(px(8.)).rounded_full().bg(rgb(if f.up {
-                                C::GREEN
-                            } else {
-                                0x3a4252
-                            })))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .child(if cfg!(windows) && !f.desc.is_empty() {
-                                        f.desc.clone()
-                                    } else {
-                                        f.name.clone()
-                                    }),
-                            )
-                            .when(f.loopback, |d| d.child(label("loopback"))),
-                    )
-                    .child(
-                        label(
-                            [
-                                f.addrs.join(", "),
-                                if cfg!(windows) {
-                                    String::new()
-                                } else {
-                                    f.desc.clone()
-                                },
-                            ]
-                            .into_iter()
-                            .filter(|s| !s.is_empty())
-                            .collect::<Vec<_>>()
-                            .join(" · "),
+                        chip(
+                            "promisc",
+                            "Promiscuous",
+                            s.promisc,
+                            act(&weak, |s: &mut Session, _, _| s.promisc = !s.promisc),
                         )
-                        .pl(px(16.)),
+                        .tooltip(tip(
+                            "Capture all frames seen by the interface, not only those addressed to this machine.",
+                        )),
                     )
-                    .on_click(act(&view, move |t: &mut Self, _, _| {
-                        t.iface = Some(i);
-                        t.picker_open = false;
-                    }))
-            }))
+                    .child(
+                        chip(
+                            "snap",
+                            "Headers only",
+                            headers,
+                            act(&weak, |s: &mut Session, _, _| {
+                                s.limits.snaplen = match s.limits.snaplen {
+                                    None => Some(128),
+                                    Some(_) => None,
+                                }
+                            }),
+                        )
+                        .tooltip(tip(
+                            "Keep only the first 128 bytes of each packet. Payloads cannot be reconstructed.",
+                        )),
+                    )
+                    .child(
+                        chip(
+                            "save",
+                            "Save to .pcap",
+                            s.save,
+                            act(&weak, |s: &mut Session, _, _| s.save = !s.save),
+                        )
+                        .tooltip(tip(
+                            "Also write every captured packet to ~/capture-<time>.pcap",
+                        )),
+                    );
+            }
+            Kind::File => {
+                first = first
+                    .child(self.file.clone())
+                    .child(button2(
+                        "cap-open",
+                        "Open",
+                        act(&view, |t: &mut Self, _, cx| t.open_typed(cx)),
+                    ))
+                    .child(self.bpf.clone());
+            }
+            Kind::Decode => {}
+        }
+        let panes: &[(Pane, &str)] = match self.kind {
+            Kind::Live => &[],
+            Kind::File => &[(Pane::Packets, "Packets"), (Pane::FileInfo, "File details")],
+            Kind::Decode => &[(Pane::Packets, "Packets"), (Pane::Hex, "Paste hex")],
+        };
+        let panes: Vec<_> = panes
+            .iter()
+            .map(|(p, name)| {
+                let p = *p;
+                chip(
+                    *name,
+                    *name,
+                    self.pane == p,
+                    act(&view, move |t: &mut Self, _, _| t.pane = p),
+                )
+            })
+            .collect();
+        let shown = self.visible.clone();
+        div().flex().flex_col().child(first).child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .px_5()
+                .py_2()
+                .bg(rgb(C::PANEL))
+                .border_b_1()
+                .border_color(rgb(C::BORDER))
+                .children(panes)
+                .when(self.pane == Pane::Packets, |d| {
+                    d.child(self.display.clone())
+                        .when(self.kind == Kind::Live, |d| {
+                            d.child(chip(
+                                "follow",
+                                "Auto-scroll",
+                                self.follow,
+                                act(&view, |t: &mut Self, _, _| t.follow = !t.follow),
+                            ))
+                        })
+                        .children(self.proto.map(|p| {
+                            chip(
+                                "proto-clear",
+                                format!("{p}  ✕"),
+                                true,
+                                act(&view, move |t: &mut Self, _, cx| t.set_proto(p, cx)),
+                            )
+                        }))
+                        .child(label(format!("{} shown", self.visible.len())))
+                })
+                .child(div().flex_1())
+                .child(button2(
+                    "cap-save",
+                    "Save shown…",
+                    act(&weak, move |s: &mut Session, _, _| s.save_packets(&shown)),
+                ))
+                .child(button2(
+                    "cap-clear",
+                    "Clear",
+                    act(&weak, |s: &mut Session, _, _| s.clear()),
+                )),
+        )
     }
 
     fn render_row(&self, vi: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let idx = self.visible[vi];
-        let p = &self.packets[idx];
-        let t0 = self.stats.first.unwrap_or(p.ts);
+        let s = self.session.read(cx);
+        let Some((idx, p)) = self
+            .visible
+            .get(vi)
+            .and_then(|&i| Some((i, s.a.packets.get(i)?)))
+        else {
+            return div().into_any_element();
+        };
+        let t0 = s.a.stats.first.unwrap_or(p.ts);
         let selected = self.selected == Some(idx);
+        let cols = self.cols();
         let color = proto_color(&p.d.proto);
+        let info = match &p.comment {
+            Some(c) => format!("{}  ✎ {c}", p.d.info),
+            None => p.d.info.clone(),
+        };
         div()
             .id(("pkt", idx))
             .w_full()
@@ -559,6 +647,13 @@ impl CaptureView {
             })
             .hover(|s| s.bg(rgb(C::PANEL2)))
             .cursor_pointer()
+            .child(cell(cols[0].1, p.no.to_string()).text_color(rgb(C::MUTED)))
+            .child(cell(cols[1].1, format!("{:.6}", p.ts - t0)).text_color(rgb(C::MUTED)))
+            .child(cell(cols[2].1, p.d.src.clone()))
+            .child(cell(cols[3].1, p.d.dst.clone()))
+            .child(cell(cols[4].1, p.d.proto.clone()).text_color(rgb(color)))
+            .child(cell(cols[5].1, p.len.to_string()))
+            .child(cell(0., clip(&info, 400)))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.selected = if this.selected == Some(idx) {
                     None
@@ -568,32 +663,31 @@ impl CaptureView {
                 this.follow = false;
                 cx.notify();
             }))
-            .child(cell(COLS[0].1, p.no.to_string()).text_color(rgb(C::MUTED)))
-            .child(cell(COLS[1].1, format!("{:.6}", p.ts - t0)).text_color(rgb(C::MUTED)))
-            .child(cell(COLS[2].1, p.d.src.clone()))
-            .child(cell(COLS[3].1, p.d.dst.clone()))
-            .child(cell(COLS[4].1, p.d.proto.clone()).text_color(rgb(color)))
-            .child(cell(COLS[5].1, p.len.to_string()))
-            .child(cell(0., p.d.info.clone()))
             .into_any_element()
     }
 
-    fn render_packets(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_packets(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let s = self.session.read(cx);
         let body = if self.visible.is_empty() {
-            let (title, hint) = if self.handle.is_some() {
+            let (title, hint) = if s.running() {
                 (
                     "Waiting for packets…",
                     "Generate some traffic, or check the capture filter.",
                 )
-            } else if !self.packets.is_empty() {
+            } else if !s.a.packets.is_empty() {
                 (
                     "No packets match the display filter",
                     "Terms match protocol, addresses, ports and info; prefix with ! to exclude.",
                 )
+            } else if self.kind == Kind::File {
+                (
+                    "No file open",
+                    "Open a .pcap or .pcapng file (gzip is fine). No capture rights are needed.",
+                )
             } else {
                 (
                     "No packets",
-                    "Choose an interface and press Start, or open a .pcap / .pcapng file.",
+                    "Choose an interface and start a capture, or open a capture file.",
                 )
             };
             empty_state(title, hint).into_any_element()
@@ -609,331 +703,348 @@ impl CaptureView {
             .flex_1()
             .into_any_element()
         };
+        let recent = (self.kind == Kind::File && self.visible.is_empty())
+            .then(|| self.render_recent().into_any_element());
+        let detail = self
+            .selected
+            .and_then(|i| self.render_detail(i, cx).map(|d| d.into_any_element()));
         div()
             .flex()
             .flex_col()
             .flex_1()
+            .min_w_0()
             .min_h_0()
-            .child(table_header(&COLS))
+            .child(table_header(self.cols()))
             .child(body)
-            .children(self.selected.map(|i| self.render_detail(i, cx)))
+            .children(recent)
+            .children(detail)
     }
 
-    fn render_detail(&self, idx: usize, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = &self.packets[idx];
-        let mut layers = vec![{
-            let mut l = dissect::Layer {
-                name: format!("Frame {}", p.no),
-                fields: Vec::new(),
-            };
-            l.fields.push((
-                "Length".into(),
-                format!("{} bytes ({} captured)", p.len, p.data.len()),
-            ));
-            l.fields.push(("Arrival".into(), format_ts(p.ts)));
-            l.fields.push((
-                "Link type".into(),
-                dissect::linktype_name(self.linktype).into(),
-            ));
-            l
-        }];
-        layers.extend(p.d.layers.iter().cloned());
+    fn render_recent(&self) -> impl IntoElement + use<> {
+        let weak = self.session.downgrade();
+        let list = crate::settings::get().recent_captures;
         div()
+            .p_5()
             .flex()
-            .flex_row()
-            .h(px(280.))
+            .flex_col()
+            .gap_1()
+            .when(!list.is_empty(), |d| d.child(section_title("Recent files")))
+            .children(list.into_iter().enumerate().map(|(i, p)| {
+                div()
+                    .id(("recent", i))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_sm()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(C::PANEL2)))
+                    .child(p.clone())
+                    .on_click(act(&weak, move |s: &mut Session, _, cx| {
+                        s.open(p.clone().into(), cx)
+                    }))
+            }))
+    }
+
+    fn render_detail(
+        &mut self,
+        idx: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement + use<>> {
+        let s = self.session.read(cx);
+        let p = s.a.packets.get(idx)?;
+        let key = (self.generation, idx);
+        if self.detail.as_ref().is_none_or(|(k, _)| *k != key) {
+            self.detail = Some((key, dissect::dissect(p.linktype, &p.data)));
+        }
+        let (_, d) = self.detail.as_ref()?;
+        let mut frame = dissect::Layer::new(format!("Frame {}", p.no));
+        frame
+            .f(
+                "Length",
+                format!("{} bytes ({} captured)", p.len, p.data.len()),
+            )
+            .f("Arrival", session::format_ts(p.ts))
+            .f("Link type", dissect::linktype_name(p.linktype))
+            .f("Protocols", d.path.join(" › "));
+        if let Some(h) = d.how {
+            frame.f("Identified by", format!("{}: {}", d.proto, h.text()));
+        }
+        if let Some(f) = s.info.as_ref().and_then(|i| i.ifaces.get(p.iface as usize))
+            && !f.name.is_empty()
+        {
+            frame.f("Interface", &f.name);
+        }
+        if let Some(c) = &p.comment {
+            frame.f("Comment", c);
+        }
+        let stream = s.a.stream_of.get(idx).copied().flatten();
+        let layers: Vec<_> = std::iter::once(frame)
+            .chain(d.layers.iter().cloned())
+            .collect();
+        let dump = dissect::hexdump(&p.data);
+        let copy = dump.join("\n");
+        let weak = self.session.downgrade();
+        Some(
+            div()
+                .flex()
+                .flex_row()
+                .h(px(300.))
+                .flex_none()
+                .border_t_1()
+                .border_color(rgb(C::BORDER))
+                .bg(rgb(C::PANEL))
+                .child(
+                    div()
+                        .id("layers")
+                        .flex_1()
+                        .min_w_0()
+                        .p_4()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .overflow_y_scroll()
+                        .text_sm()
+                        .children(stream.map(|id| {
+                            let go = |tool: Tool, name: &'static str| {
+                                chip(
+                                    name,
+                                    name,
+                                    false,
+                                    act(&weak, move |s: &mut Session, _, cx| {
+                                        s.stream = Some(id as usize);
+                                        cx.emit(OpenTool(tool));
+                                    }),
+                                )
+                            };
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(go(Tool::TcpStreams, "Follow TCP stream"))
+                                .child(go(Tool::Handshake, "Handshake"))
+                        }))
+                        .children(layers.into_iter().map(layer_block)),
+                )
+                .child(
+                    div()
+                        .id("hexdump")
+                        .w(px(600.))
+                        .flex_none()
+                        .p_4()
+                        .border_l_1()
+                        .border_color(rgb(C::BORDER))
+                        .overflow_y_scroll()
+                        .font_family(mono())
+                        .text_xs()
+                        .text_color(rgb(C::MUTED))
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .items_center()
+                                .child(section_title("Bytes"))
+                                .child(div().flex_1())
+                                .child(copy_button("copy-hex", copy))
+                                .child(chip(
+                                    "close-detail",
+                                    "✕",
+                                    false,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.selected = None;
+                                        cx.notify();
+                                    }),
+                                )),
+                        )
+                        .children(
+                            dump.into_iter()
+                                .take(256)
+                                .map(|l| div().whitespace_nowrap().child(l)),
+                        ),
+                ),
+        )
+    }
+
+    fn render_file_info(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let s = self.session.read(cx);
+        match &s.info {
+            None => empty_state(
+                if s.running() {
+                    "Reading…"
+                } else {
+                    "No file open"
+                },
+                "Details appear when a capture file has been read.",
+            )
+            .into_any_element(),
+            Some(i) => div()
+                .id("file-info")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .p_5()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .text_sm()
+                .child(section_title("Capture file"))
+                .children(
+                    session::file_info_rows(i)
+                        .into_iter()
+                        .map(|(k, v)| kv_row(k, v, 180.)),
+                )
+                .into_any_element(),
+        }
+    }
+
+    /// Protocol tree of the capture; a click filters the list.
+    fn render_protocols(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let view = cx.entity().downgrade();
+        let st = &self.session.read(cx).a.stats;
+        let total = st.packets.max(1);
+        let rows = st.hierarchy();
+        let (sig, port) = (st.by_signature, st.by_port);
+        let active = self.proto;
+        div()
+            .id("protocols")
+            .w(px(300.))
             .flex_none()
-            .border_t_1()
+            .h_full()
+            .p_3()
+            .flex()
+            .flex_col()
+            .overflow_y_scroll()
+            .border_r_1()
             .border_color(rgb(C::BORDER))
             .bg(rgb(C::PANEL))
-            .child(
+            .text_sm()
+            .child(section_title("Protocols found"))
+            .child(label(format!("By content {sig} · by port only {port}")).pb_2())
+            .children(rows.into_iter().enumerate().map(|(i, r)| {
+                let name = r.name;
                 div()
-                    .id("layers")
-                    .flex_1()
-                    .min_w_0()
-                    .p_4()
+                    .id(("proto", i))
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .h(px(24.))
+                    .pl(px(4. + 14. * r.depth as f32))
+                    .pr_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(active == Some(name), |d| d.bg(rgb(C::SELECT)))
+                    .hover(|s| s.bg(rgb(C::PANEL2)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_color(rgb(proto_color(name)))
+                            .child(name),
+                    )
+                    .child(label(format!(
+                        "{} · {:.1}%",
+                        r.packets,
+                        r.packets as f64 * 100. / total as f64
+                    )))
+                    .on_click(act(&view, move |t: &mut Self, _, cx| t.set_proto(name, cx)))
+            }))
+    }
+
+    fn render_hex(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let view = cx.entity().downgrade();
+        let text = self.hex.read(cx).value.clone();
+        let parsed = dissect::parse_hex(&text);
+        let links = [(1, "Ethernet"), (101, "Raw IP"), (113, "Linux cooked")];
+        let result = match &parsed {
+            Err(e) => label(e.clone()).text_color(rgb(C::RED)).into_any_element(),
+            Ok(b) if b.is_empty() => label("Nothing to decode yet").into_any_element(),
+            Ok(b) => {
+                let d = dissect::dissect(self.hex_link, b);
+                let mut top = dissect::Layer::new(format!("{} bytes", b.len()));
+                top.f("Protocols", d.path.join(" › "))
+                    .f("Summary", format!("{}  {}", d.proto, d.info));
+                if let Some(h) = d.how {
+                    top.f("Identified by", h.text());
+                }
+                div()
                     .flex()
                     .flex_col()
                     .gap_3()
-                    .overflow_y_scroll()
-                    .text_sm()
-                    .children(layers.into_iter().map(|l| {
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(section_title(&l.name))
-                            .children(l.fields.into_iter().map(|(k, v)| kv_row(k, v, 150.)))
-                    })),
-            )
-            .child(
-                div()
-                    .id("hexdump")
-                    .w(px(600.))
-                    .flex_none()
-                    .p_4()
-                    .border_l_1()
-                    .border_color(rgb(C::BORDER))
-                    .overflow_y_scroll()
-                    .font_family(mono())
-                    .text_xs()
-                    .text_color(rgb(C::MUTED))
-                    .child(
-                        div()
-                            .flex()
-                            .justify_between()
-                            .child(section_title("Bytes"))
-                            .child(
-                                div()
-                                    .id("close-detail")
-                                    .px_2()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(rgb(C::PANEL2)))
-                                    .child("✕")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.selected = None;
-                                        cx.notify();
-                                    })),
-                            ),
-                    )
-                    .children(
-                        dissect::hexdump(&p.data)
-                            .into_iter()
-                            .take(256)
-                            .map(|l| div().whitespace_nowrap().child(l)),
-                    ),
-            )
-    }
-
-    fn render_analysis(&self) -> impl IntoElement {
-        let s = &self.stats;
-        let dur = s.duration();
-        let mut protos: Vec<_> = s.protos.iter().collect();
-        protos.sort_by_key(|a| std::cmp::Reverse(a.1.0));
-        let mut talkers: Vec<_> = s.talkers.iter().collect();
-        talkers.sort_by_key(|a| std::cmp::Reverse(a.1.1 + a.1.3));
-        let mut convs: Vec<_> = s.convs.iter().collect();
-        convs.sort_by_key(|a| std::cmp::Reverse(a.1.bytes));
-
-        let tile = |k: &str, v: String| {
-            div()
-                .flex()
-                .flex_col()
-                .px_4()
-                .py_3()
-                .rounded_md()
-                .bg(rgb(C::PANEL))
-                .border_1()
-                .border_color(rgb(C::BORDER))
-                .child(label(k.to_string()))
-                .child(
-                    div()
-                        .text_xl()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .child(v),
-                )
+                    .child(layer_block(top))
+                    .children(d.layers.into_iter().map(layer_block))
+                    .into_any_element()
+            }
         };
-        let panel = |title: String| {
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .p_4()
-                .rounded_md()
-                .bg(rgb(C::PANEL))
-                .border_1()
-                .border_color(rgb(C::BORDER))
-                .text_sm()
-                .child(section_title(&title))
-        };
-        let row = |cols: Vec<(f32, String, u32)>| {
-            div().flex().flex_row().items_center().h(px(24.)).children(
-                cols.into_iter()
-                    .map(|(w, t, c)| cell(w, t).text_color(rgb(c))),
-            )
-        };
-        let total = s.packets.max(1) as f32;
-
         div()
-            .id("analysis")
+            .id("hex-pane")
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
             .p_5()
             .flex()
             .flex_col()
-            .gap_4()
+            .gap_3()
+            .text_sm()
             .child(
                 div()
                     .flex()
-                    .flex_wrap()
-                    .gap_3()
-                    .child(tile("Packets", s.packets.to_string()))
-                    .child(tile("Data", human_bytes(s.bytes)))
-                    .child(tile("Duration", format!("{dur:.1} s")))
-                    .child(tile(
-                        "Avg rate",
-                        if dur > 0.0 {
-                            format!("{:.0} pkt/s", s.packets as f64 / dur)
-                        } else {
-                            "—".into()
-                        },
-                    ))
-                    .child(tile(
-                        "Avg throughput",
-                        if dur > 0.0 {
-                            format!("{}/s", human_bits(s.bytes as f64 * 8.0 / dur))
-                        } else {
-                            "—".into()
-                        },
-                    ))
-                    .child(tile(
-                        "Avg size",
-                        s.bytes
-                            .checked_div(s.packets)
-                            .map(|b| format!("{b} B"))
-                            .unwrap_or_else(|| "—".into()),
-                    ))
-                    .child(tile("Hosts", s.talkers.len().to_string()))
-                    .child(tile("Conversations", s.convs.len().to_string()))
-                    .when_some(self.pcap_stats, |d, (_, dropped, ifd)| {
-                        d.child(tile("Dropped (kernel/if)", format!("{dropped} / {ifd}")))
-                    }),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap_4()
-                    .items_start()
-                    .child(
-                        panel(format!("Protocols ({})", protos.len()))
-                            .w(px(440.))
-                            .flex_none()
-                            .child(row(vec![
-                                (130., "PROTOCOL".into(), C::MUTED),
-                                (80., "PACKETS".into(), C::MUTED),
-                                (90., "BYTES".into(), C::MUTED),
-                                (0., "SHARE".into(), C::MUTED),
-                            ]))
-                            .children(protos.iter().take(40).map(|(name, (n, b))| {
-                                let frac = *n as f32 / total;
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .h(px(24.))
-                                    .child(
-                                        cell(130., name.to_string())
-                                            .text_color(rgb(proto_color(name))),
-                                    )
-                                    .child(cell(80., n.to_string()))
-                                    .child(cell(90., human_bytes(*b)))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .child(
-                                                div()
-                                                    .h(px(8.))
-                                                    .w(px(100. * frac))
-                                                    .rounded_sm()
-                                                    .bg(rgb(proto_color(name))),
-                                            )
-                                            .child(label(format!("{:.1}%", frac * 100.))),
-                                    )
-                            })),
-                    )
-                    .child(
-                        panel(format!("Top talkers ({})", talkers.len()))
-                            .flex_1()
-                            .min_w_0()
-                            .child(row(vec![
-                                (240., "ADDRESS".into(), C::MUTED),
-                                (110., "SENT".into(), C::MUTED),
-                                (110., "RECEIVED".into(), C::MUTED),
-                                (0., "TOTAL".into(), C::MUTED),
-                            ]))
-                            .children(talkers.iter().take(25).map(|(ip, (tp, tb, rp, rb))| {
-                                row(vec![
-                                    (240., ip.to_string(), C::TEXT),
-                                    (110., format!("{tp} · {}", human_bytes(*tb)), C::MUTED),
-                                    (110., format!("{rp} · {}", human_bytes(*rb)), C::MUTED),
-                                    (0., human_bytes(tb + rb), C::TEXT),
-                                ])
-                            })),
-                    ),
-            )
-            .child(
-                panel(format!("Conversations ({})", convs.len()))
-                    .child(row(vec![
-                        (70., "PROTO".into(), C::MUTED),
-                        (300., "ENDPOINT A".into(), C::MUTED),
-                        (300., "ENDPOINT B".into(), C::MUTED),
-                        (90., "PACKETS".into(), C::MUTED),
-                        (100., "BYTES".into(), C::MUTED),
-                        (0., "DURATION".into(), C::MUTED),
-                    ]))
-                    .children(convs.iter().take(60).map(|((a, b, proto), c)| {
-                        row(vec![
-                            (70., proto.to_string(), C::CYAN),
-                            (300., a.clone(), C::TEXT),
-                            (300., b.clone(), C::TEXT),
-                            (90., c.packets.to_string(), C::MUTED),
-                            (100., human_bytes(c.bytes), C::MUTED),
-                            (0., format!("{:.2} s", c.last - c.first), C::MUTED),
-                        ])
+                    .gap_2()
+                    .items_center()
+                    .child(label("First layer"))
+                    .children(links.map(|(lt, name)| {
+                        chip(
+                            name,
+                            name,
+                            self.hex_link == lt,
+                            act(&view, move |t: &mut Self, _, _| t.hex_link = lt),
+                        )
                     })),
             )
+            .child(self.hex.clone())
+            .child(result)
     }
 }
 
-fn filter_terms(q: &str) -> Vec<(bool, String)> {
-    q.split_whitespace()
-        .map(|t| match t.strip_prefix('!') {
-            Some(neg) => (false, neg.to_lowercase()),
-            None => (true, t.to_lowercase()),
-        })
-        .filter(|(_, t)| !t.is_empty())
-        .collect()
+/// A decoded layer with its fields.
+fn layer_block(l: dissect::Layer) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(section_title(&l.name))
+        .children(
+            l.fields
+                .into_iter()
+                .map(|(k, v)| kv_row(k, clip(&v, 2000), 170.)),
+        )
 }
 
-fn matches(p: &Packet, terms: &[(bool, String)]) -> bool {
-    if terms.is_empty() {
-        return true;
+/// Text cut to `n` characters, control characters removed (one-line cells).
+pub fn clip(s: &str, n: usize) -> String {
+    let mut out: String = s
+        .chars()
+        .take(n)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if s.chars().nth(n).is_some() {
+        out.push('…');
     }
-    let hay = format!(
-        "{} {} {} {} {} {}",
-        p.d.proto,
-        p.d.src,
-        p.d.dst,
-        p.d.src_port.map(|p| p.to_string()).unwrap_or_default(),
-        p.d.dst_port.map(|p| p.to_string()).unwrap_or_default(),
-        p.d.info
-    )
-    .to_lowercase();
-    terms
-        .iter()
-        .all(|(want, t)| hay.contains(t.as_str()) == *want)
+    out
 }
 
-fn proto_color(p: &str) -> u32 {
+pub fn proto_color(p: &str) -> u32 {
     match p {
         "TCP" => 0x8fb3ff,
         "UDP" => 0x7fd4e8,
-        "HTTP" => C::GREEN,
-        "TLS" | "QUIC" => 0x9aa8ff,
+        "HTTP" | "HTTP/2" | "WebSocket" => C::GREEN,
+        "TLS" | "QUIC" | "DTLS" => 0x9aa8ff,
         "DNS" | "mDNS" | "LLMNR" => C::CYAN,
         "ARP" => C::AMBER,
         "ICMP" | "ICMPv6" | "IGMP" => 0xf28fb3,
-        "DHCP" | "NTP" | "SSDP" | "NBNS" => 0xc4a7ff,
-        "Modbus/TCP" | "Modbus/UDP" | "PROFINET" | "EtherCAT" | "BACnet" | "EtherNet/IP" => {
-            C::PURPLE
-        }
-        "SSH" | "Telnet" | "RDP" | "SMB" => 0xffb86b,
+        "DHCP" | "DHCPv6" | "NTP" | "SSDP" | "NBNS" | "SNMP" => 0xc4a7ff,
+        "Modbus/TCP" | "Modbus/UDP" | "PROFINET" | "EtherCAT" | "BACnet" | "EtherNet/IP"
+        | "S7comm" | "OPC UA" | "DNP3" | "IEC 104" | "MQTT" | "CoAP" => C::PURPLE,
+        "SSH" | "Telnet" | "RDP" | "SMB" | "VNC" => 0xffb86b,
         _ => C::MUTED,
     }
 }
@@ -951,7 +1062,7 @@ pub fn human_bytes(b: u64) -> String {
     }
 }
 
-fn human_bits(b: f64) -> String {
+pub fn human_bits(b: f64) -> String {
     if b < 1e3 {
         format!("{b:.0} bit")
     } else if b < 1e6 {
@@ -963,12 +1074,14 @@ fn human_bits(b: f64) -> String {
     }
 }
 
-/// UTC wall-clock time of a capture timestamp.
-fn format_ts(ts: f64) -> String {
-    let secs = ts.floor() as i64;
-    let frac = ts - ts.floor();
-    let (h, m, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
-    format!("{h:02}:{m:02}:{s:02}.{:06} UTC", (frac * 1e6) as u32)
+/// Milliseconds with a sensible precision, or "—".
+pub fn ms(t: Option<f64>) -> SharedString {
+    match t {
+        None => "—".into(),
+        Some(t) if t < 0.01 => format!("{:.2} ms", t * 1000.0).into(),
+        Some(t) if t < 1.0 => format!("{:.1} ms", t * 1000.0).into(),
+        Some(t) => format!("{t:.2} s").into(),
+    }
 }
 
 impl Focusable for CaptureView {
@@ -978,49 +1091,34 @@ impl Focusable for CaptureView {
 }
 
 impl Render for CaptureView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let elapsed = self.started.map(|s| s.elapsed());
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let body = match self.pane {
+            Pane::Packets => {
+                let side = (self.kind == Kind::Decode)
+                    .then(|| self.render_protocols(cx).into_any_element());
+                let list = self.render_packets(cx).into_any_element();
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_1()
+                    .min_h_0()
+                    .children(side)
+                    .child(list)
+                    .into_any_element()
+            }
+            Pane::FileInfo => self.render_file_info(cx).into_any_element(),
+            Pane::Hex => self.render_hex(cx).into_any_element(),
+        };
+        let bar = self.render_toolbar(cx).into_any_element();
+        let s = self.session.read(cx);
         div()
             .track_focus(&self.focus)
-            .relative()
             .flex()
             .flex_col()
             .size_full()
-            .child(self.render_toolbar(cx))
-            .children(self.error.clone().map(|e| {
-                div()
-                    .px_5()
-                    .py_2()
-                    .text_sm()
-                    .text_color(rgb(C::RED))
-                    .bg(alpha(C::RED, 0.08))
-                    .children(
-                        e.lines()
-                            .map(|l| div().child(l.to_string()))
-                            .collect::<Vec<_>>(),
-                    )
-            }))
-            .child(match self.mode {
-                Mode::Packets => self.render_packets(cx).into_any_element(),
-                Mode::Analysis => self.render_analysis().into_any_element(),
-            })
-            .child(
-                status_bar()
-                    .child(div().text_color(rgb(C::TEXT)).child(self.status.clone()))
-                    .child(format!("{} packets", self.stats.packets))
-                    .child(format!("{} shown", self.visible.len()))
-                    .child(human_bytes(self.stats.bytes))
-                    .when_some(self.pcap_stats, |d, (rx, drop, _)| {
-                        d.child(format!("kernel: {rx} received, {drop} dropped"))
-                    })
-                    .when(self.dropped_ui > 0, |d| {
-                        d.child(div().text_color(rgb(C::AMBER)).child(format!(
-                            "list full: {} packets not kept (stats still counted)",
-                            self.dropped_ui
-                        )))
-                    })
-                    .children(elapsed.map(|e| format!("{:.1}s", e.as_secs_f32()))),
-            )
-            .when(self.picker_open, |d| d.child(self.render_picker(cx)))
+            .child(bar)
+            .children(error_line(&s.error))
+            .child(body)
+            .child(session_status(s))
     }
 }

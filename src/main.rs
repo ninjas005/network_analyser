@@ -2,6 +2,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod anomaly;
+mod appproto;
 mod arpwatch;
 mod audit;
 mod audit_view;
@@ -23,10 +24,14 @@ mod dns_client;
 mod dns_client_view;
 mod dns_view;
 mod dnscheck;
+mod dnsmon;
+mod dnsmon_view;
 mod firewall;
 mod firewall_view;
+mod flows_view;
 mod gateway;
 mod gateway_view;
+mod httpstream;
 mod modbus;
 mod modbus_view;
 mod monitor;
@@ -41,7 +46,11 @@ mod ntp_view;
 mod opcua;
 mod opcua_crypto;
 mod opcua_view;
+mod pcap_cli;
+mod pcapfile;
 mod perf_view;
+mod pktstats;
+mod pktstats_view;
 mod platform;
 mod portscan;
 mod portscan_view;
@@ -51,12 +60,14 @@ mod profinet_view;
 mod scanner;
 mod serial;
 mod serial_view;
+mod session;
 mod settings;
 mod sftp;
 mod sftp_view;
 mod shell;
 mod snmp;
 mod snmp_view;
+mod streams;
 mod svcdetect;
 mod throughput;
 mod tls;
@@ -104,8 +115,10 @@ OPTIONS:
     --windowed    Open in a normal window (development)
     --scan        Start scanning the local subnet immediately
     --tool TOOL   Open a tool: lan, gateway, traceroute, dns, rdns, dhcp,
-                  wol, ports, capture, modbus, serial, netconfig,
-                  publicip, geoip, base64 (--tab is an alias)
+                  wol, ports, capture, pcap, decode, streams, http,
+                  handshake, dns-monitor, packet-stats, modbus, serial,
+                  netconfig, publicip, geoip, base64 (--tab is an alias)
+    --open FILE   Open a .pcap / .pcapng capture file (also .gz)
     --no-update-check
                   Don't look for a new release on start (also:
                   NETWORK_ANALYSER_NO_UPDATE_CHECK=1)
@@ -164,6 +177,13 @@ OPTIONS:
                   --cert/--key = mutual TLS
     --ws URL [MESSAGE]
                   WebSocket handshake, send a message and a ping, print frames
+    --pcap FILE [info | packets | decode N | streams | follow N [hex] | http |
+                http-body N [response|request] | handshakes | dns | stats]
+           [-f BPF] [-d DISPLAY-FILTER]
+                  Analyse a capture file: decoding, TCP streams, HTTP, handshakes,
+                  DNS, statistics
+    --capture IFACE [-n PACKETS] [-t SECONDS] [-f BPF] [-w FILE.pcap] [--no-promisc]
+                  Live capture to stdout, then statistics (needs capture rights)
     --list-ifaces List packet-capture interfaces
     --list-serial List serial ports
     --update-oui  Download the latest IEEE MAC-vendor list (needs curl)
@@ -185,6 +205,7 @@ fn main() {
     let mut mode = Mode::Fullscreen;
     let mut autoscan = false;
     let mut tab = Tool::LanScan;
+    let mut open: Option<std::path::PathBuf> = None;
     let mut update_check = std::env::var_os("NETWORK_ANALYSER_NO_UPDATE_CHECK").is_none();
     let mut i = 0;
     while i < args.len() {
@@ -207,6 +228,17 @@ fn main() {
                     eprintln!("--tool: expected one of {}", names.join(", "));
                     std::process::exit(2)
                 });
+            }
+            "--open" => {
+                i += 1;
+                let Some(f) = args.get(i) else {
+                    eprintln!("--open: missing FILE");
+                    std::process::exit(2)
+                };
+                open = Some(f.into());
+                if tab == Tool::LanScan {
+                    tab = Tool::PcapViewer;
+                }
             }
             "--no-update-check" => update_check = false,
             "--check-update" => return run_check_update(),
@@ -237,6 +269,8 @@ fn main() {
             "--bacnet" => return bacnet::cli(&args[i + 1..]),
             "--opcua" => return opcua::cli(&args[i + 1..]),
             "--mqtt" => return mqtt::cli(&args[i + 1..]),
+            "--pcap" => return pcap_cli::pcap(&args[i + 1..]),
+            "--capture" => return pcap_cli::live(&args[i + 1..]),
             "--ws" => return websocket::cli(&args[i + 1..]),
             "--list-ifaces" => {
                 match capture::interfaces() {
@@ -290,7 +324,7 @@ fn main() {
         }
         i += 1;
     }
-    run_gui(mode, autoscan, tab, update_check);
+    run_gui(mode, autoscan, tab, update_check, open);
 }
 
 fn run_check_update() {
@@ -311,7 +345,13 @@ fn run_check_update() {
     }
 }
 
-fn run_gui(mode: Mode, autoscan: bool, tab: Tool, update_check: bool) {
+fn run_gui(
+    mode: Mode,
+    autoscan: bool,
+    tab: Tool,
+    update_check: bool,
+    open: Option<std::path::PathBuf>,
+) {
     let kiosk = mode == Mode::Kiosk;
     Application::new().run(move |cx: &mut App| {
         cx.bind_keys([
@@ -380,6 +420,9 @@ fn run_gui(mode: Mode, autoscan: bool, tab: Tool, update_check: bool) {
                     });
                     cx.new(|cx| {
                         let mut shell = Shell::new(kiosk, lan, update_check, window, cx);
+                        if let Some(f) = open {
+                            session::Session::shared(cx).update(cx, |s, cx| s.open(f, cx));
+                        }
                         shell.select(tab, window, cx);
                         shell
                     })

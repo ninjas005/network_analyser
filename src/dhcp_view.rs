@@ -219,7 +219,7 @@ impl DhcpView {
                 CaptureEvent::InjectFailed(e) => {
                     self.error = Some(format!("Could not send DISCOVER: {e}"))
                 }
-                CaptureEvent::Stats { .. } => {}
+                CaptureEvent::Stats { .. } | CaptureEvent::FileInfo(_) => {}
                 CaptureEvent::Stopped(err) => stopped = Some(err),
             }
         }

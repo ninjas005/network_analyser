@@ -8,6 +8,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
 use crate::dissect::{self, Dissected};
+use crate::pcapfile;
 
 #[derive(Clone, Debug)]
 pub struct Interface {
@@ -114,11 +115,31 @@ pub struct CaptureConfig {
     pub save_to: Option<PathBuf>,
 }
 
+/// Bytes kept per packet. Frames joined by segmentation offload are up to
+/// 64 KB plus the link header, so 65535 would cut them.
+const SNAPLEN: i32 = 262_144;
+
+/// When a live capture ends by itself, and how much of each packet to keep.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Limits {
+    pub packets: Option<u64>,
+    pub seconds: Option<u64>,
+    pub bytes: Option<u64>,
+    /// Bytes kept per packet (default: everything).
+    pub snaplen: Option<u32>,
+}
+
+#[derive(Default)]
 pub struct Packet {
     pub no: usize,
     /// Seconds since the Unix epoch.
     pub ts: f64,
     pub len: u32,
+    pub linktype: i32,
+    /// Interface index within a pcapng file.
+    pub iface: u32,
+    /// Packet comment from a pcapng file.
+    pub comment: Option<String>,
     pub data: Vec<u8>,
     pub d: Dissected,
 }
@@ -135,6 +156,8 @@ pub enum CaptureEvent {
         if_dropped: u32,
     },
     InjectFailed(String),
+    /// Details of a capture file, sent after its last packet.
+    FileInfo(Box<pcapfile::FileInfo>),
     Stopped(Option<String>),
 }
 
@@ -162,6 +185,16 @@ impl Drop for CaptureHandle {
 }
 
 pub fn start(cfg: CaptureConfig) -> CaptureHandle {
+    spawn(cfg, Limits::default(), false)
+}
+
+/// Capture for the packet tools: with limits, and without decoding the layer
+/// details (`Dissected::layers` is empty; they are decoded when needed).
+pub fn start_brief(cfg: CaptureConfig, limits: Limits) -> CaptureHandle {
+    spawn(cfg, limits, true)
+}
+
+fn spawn(cfg: CaptureConfig, limits: Limits, brief: bool) -> CaptureHandle {
     let (tx, rx) = channel();
     let (itx, irx) = channel();
     let stop = Arc::new(AtomicBool::new(false));
@@ -169,7 +202,7 @@ pub fn start(cfg: CaptureConfig) -> CaptureHandle {
     std::thread::Builder::new()
         .name("capture".into())
         .spawn(move || {
-            let err = run(cfg, &tx, &flag, &irx).err();
+            let err = run(cfg, limits, brief, &tx, &flag, &irx).err();
             let _ = tx.send(CaptureEvent::Stopped(err));
         })
         .expect("spawn capture thread");
@@ -187,17 +220,35 @@ struct Batcher<'a> {
     last: Instant,
     no: usize,
     linktype: i32,
+    brief: bool,
 }
 
 impl Batcher<'_> {
     fn push(&mut self, h: &pcap::PacketHeader, data: &[u8]) {
+        self.push_raw(pcapfile::RawPacket {
+            ts: h.ts.tv_sec as f64 + h.ts.tv_usec as f64 / 1e6,
+            len: h.len,
+            iface: 0,
+            linktype: self.linktype,
+            data: data.to_vec(),
+            comment: None,
+        });
+    }
+    fn push_raw(&mut self, p: pcapfile::RawPacket) {
         self.no += 1;
         self.buf.push(Packet {
             no: self.no,
-            ts: h.ts.tv_sec as f64 + h.ts.tv_usec as f64 / 1e6,
-            len: h.len,
-            data: data.to_vec(),
-            d: dissect::dissect(self.linktype, data),
+            ts: p.ts,
+            len: p.len,
+            linktype: p.linktype,
+            iface: p.iface,
+            comment: p.comment,
+            d: if self.brief {
+                dissect::dissect_brief(p.linktype, &p.data)
+            } else {
+                dissect::dissect(p.linktype, &p.data)
+            },
+            data: p.data,
         });
         if self.buf.len() >= 512 {
             self.flush();
@@ -218,51 +269,100 @@ impl Batcher<'_> {
     }
 }
 
+/// BPF programs for a capture file, one per link type in it.
+struct FileFilter {
+    expr: String,
+    progs: Vec<(i32, pcap::BpfProgram)>,
+}
+
+impl FileFilter {
+    fn accepts(&mut self, p: &pcapfile::RawPacket) -> Result<bool, String> {
+        if !self.progs.iter().any(|(t, _)| *t == p.linktype) {
+            available()?;
+            let cap = pcap::Capture::dead(pcap::Linktype(p.linktype)).map_err(|e| e.to_string())?;
+            let prog = cap
+                .compile(&self.expr, true)
+                .map_err(|e| format!("filter: {e}"))?;
+            self.progs.push((p.linktype, prog));
+        }
+        Ok(self
+            .progs
+            .iter()
+            .find(|(t, _)| *t == p.linktype)
+            .is_some_and(|(_, prog)| prog.filter(&p.data)))
+    }
+}
+
+fn read_file(
+    path: &std::path::Path,
+    filter: &str,
+    brief: bool,
+    tx: &Sender<CaptureEvent>,
+    stop: &AtomicBool,
+) -> Result<(), String> {
+    let mut filter = (!filter.is_empty()).then(|| FileFilter {
+        expr: filter.to_string(),
+        progs: Vec::new(),
+    });
+    let mut b = Batcher {
+        tx,
+        buf: Vec::new(),
+        last: Instant::now(),
+        no: 0,
+        linktype: 1,
+        brief,
+    };
+    let mut err = None;
+    let mut started = false;
+    let info = pcapfile::read(path, &mut |p| {
+        if !started {
+            started = true;
+            let _ = tx.send(CaptureEvent::Started {
+                linktype: p.linktype,
+                desc: path.display().to_string(),
+            });
+        }
+        match filter.as_mut().map(|f| f.accepts(&p)) {
+            None | Some(Ok(true)) => b.push_raw(p),
+            Some(Ok(false)) => {}
+            Some(Err(e)) => {
+                err = Some(e);
+                return false;
+            }
+        }
+        !stop.load(Ordering::Relaxed)
+    })?;
+    b.flush();
+    if !started {
+        let _ = tx.send(CaptureEvent::Started {
+            linktype: info.ifaces.first().map_or(1, |i| i.linktype),
+            desc: path.display().to_string(),
+        });
+    }
+    let _ = tx.send(CaptureEvent::FileInfo(Box::new(info)));
+    err.map_or(Ok(()), Err)
+}
+
 fn run(
     cfg: CaptureConfig,
+    limits: Limits,
+    brief: bool,
     tx: &Sender<CaptureEvent>,
     stop: &AtomicBool,
     inject: &Receiver<Vec<u8>>,
 ) -> Result<(), String> {
-    available()?;
     match &cfg.source {
-        Source::File(path) => {
-            let mut cap =
-                pcap::Capture::from_file(path).map_err(|e| format!("{}: {e}", path.display()))?;
-            if !cfg.filter.trim().is_empty() {
-                cap.filter(cfg.filter.trim(), true)
-                    .map_err(|e| format!("filter: {e}"))?;
-            }
-            let linktype = cap.get_datalink().0;
-            let _ = tx.send(CaptureEvent::Started {
-                linktype,
-                desc: format!("{} ({})", path.display(), dissect::linktype_name(linktype)),
-            });
-            let mut b = Batcher {
-                tx,
-                buf: Vec::new(),
-                last: Instant::now(),
-                no: 0,
-                linktype,
-            };
-            while !stop.load(Ordering::Relaxed) {
-                match cap.next_packet() {
-                    Ok(p) => b.push(p.header, p.data),
-                    Err(pcap::Error::NoMorePackets) => break,
-                    Err(e) => {
-                        b.flush();
-                        return Err(e.to_string());
-                    }
-                }
-            }
-            b.flush();
-            Ok(())
-        }
+        Source::File(path) => read_file(path, cfg.filter.trim(), brief, tx, stop),
         Source::Live { device, promisc } => {
+            available()?;
             let mut cap = pcap::Capture::from_device(device.as_str())
                 .map_err(|e| e.to_string())?
                 .promisc(*promisc)
-                .snaplen(65535)
+                .snaplen(
+                    limits
+                        .snaplen
+                        .map_or(SNAPLEN, |n| n.clamp(64, SNAPLEN as u32) as i32),
+                )
                 .timeout(100)
                 .immediate_mode(true)
                 .buffer_size(8 << 20)
@@ -272,6 +372,11 @@ fn run(
                 cap.filter(cfg.filter.trim(), true)
                     .map_err(|e| format!("filter: {e}"))?;
             }
+            // On Linux the read timeout is not honoured in immediate mode: a
+            // blocking read on a quiet link would never notice `stop`, the
+            // limits or frames to inject. Poll with a timeout instead.
+            #[cfg(unix)]
+            let mut cap = cap.setnonblock().map_err(|e| e.to_string())?;
             let linktype = cap.get_datalink().0;
             let mut save = match &cfg.save_to {
                 Some(p) => Some(
@@ -290,9 +395,20 @@ fn run(
                 last: Instant::now(),
                 no: 0,
                 linktype,
+                brief,
             };
             let mut last_stats = Instant::now();
+            let began = Instant::now();
+            let mut bytes = 0u64;
             while !stop.load(Ordering::Relaxed) {
+                if limits
+                    .seconds
+                    .is_some_and(|n| began.elapsed().as_secs() >= n)
+                    || limits.packets.is_some_and(|n| b.no as u64 >= n)
+                    || limits.bytes.is_some_and(|n| bytes >= n)
+                {
+                    break;
+                }
                 while let Ok(frame) = inject.try_recv() {
                     if let Err(e) = cap.sendpacket(frame) {
                         let _ = tx.send(CaptureEvent::InjectFailed(e.to_string()));
@@ -303,9 +419,13 @@ fn run(
                         if let Some(s) = save.as_mut() {
                             s.write(&p);
                         }
+                        bytes += p.header.len as u64;
                         b.push(p.header, p.data);
                     }
-                    Err(pcap::Error::TimeoutExpired) => {}
+                    Err(pcap::Error::TimeoutExpired) => {
+                        #[cfg(unix)]
+                        wait_readable(&cap);
+                    }
                     Err(e) => {
                         b.flush();
                         return Err(e.to_string());
@@ -332,33 +452,49 @@ fn run(
     }
 }
 
-/// Write packets to a classic .pcap file (used to export a filtered view).
-pub fn write_pcap(
-    path: &std::path::Path,
-    linktype: i32,
-    packets: &[&Packet],
-) -> std::io::Result<()> {
-    let mut out = Vec::with_capacity(24 + packets.iter().map(|p| p.data.len() + 16).sum::<usize>());
-    out.extend_from_slice(&0xa1b2c3d4u32.to_le_bytes());
-    out.extend_from_slice(&2u16.to_le_bytes());
-    out.extend_from_slice(&4u16.to_le_bytes());
-    out.extend_from_slice(&0i32.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
-    out.extend_from_slice(&65535u32.to_le_bytes());
-    out.extend_from_slice(&(linktype as u32).to_le_bytes());
-    for p in packets {
-        let secs = p.ts.trunc();
-        out.extend_from_slice(&(secs as u32).to_le_bytes());
-        out.extend_from_slice(
-            &(((p.ts - secs) * 1e6).round() as u32)
-                .min(999_999)
-                .to_le_bytes(),
-        );
-        out.extend_from_slice(&(p.data.len() as u32).to_le_bytes());
-        out.extend_from_slice(&p.len.to_le_bytes());
-        out.extend_from_slice(&p.data);
+/// Wait up to 50 ms for a packet.
+#[cfg(unix)]
+fn wait_readable(cap: &pcap::Capture<pcap::Active>) {
+    use std::os::fd::AsRawFd;
+    let mut fd = libc::pollfd {
+        fd: cap.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd that outlives the call; the descriptor is owned
+    // by `cap`.
+    let n = unsafe { libc::poll(&mut fd, 1, 50) };
+    // Never spin when poll itself fails or reports only an error condition.
+    if n < 0 || (n > 0 && fd.revents & libc::POLLIN == 0) {
+        std::thread::sleep(Duration::from_millis(20));
     }
-    std::fs::write(path, out)
+}
+
+/// Write packets to a file: pcapng when its extension says so or the packets
+/// have different link types, classic pcap otherwise.
+pub fn write_packets(path: &std::path::Path, packets: &[&Packet]) -> std::io::Result<()> {
+    let out: Vec<pcapfile::Out> = packets
+        .iter()
+        .map(|p| pcapfile::Out {
+            ts: p.ts,
+            len: p.len,
+            linktype: p.linktype,
+            data: &p.data,
+            comment: p.comment.as_deref(),
+        })
+        .collect();
+    let lt = packets.first().map_or(1, |p| p.linktype);
+    let ng = path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("pcapng"));
+    std::fs::write(
+        path,
+        if ng || packets.iter().any(|p| p.linktype != lt) {
+            pcapfile::pcapng_bytes(&out)
+        } else {
+            pcapfile::pcap_bytes(lt, &out)
+        },
+    )
 }
 
 /// Npcap installs wpcap.dll under System32\Npcap, which is not on the DLL
@@ -433,11 +569,12 @@ mod tests {
                 ts: 1_700_000_000.25 + i as f64,
                 len: f.len() as u32,
                 data: f.clone(),
-                d: Dissected::default(),
+                linktype: 1,
+                ..Default::default()
             })
             .collect();
         let path = std::env::temp_dir().join(format!("na-test-{}.pcap", std::process::id()));
-        write_pcap(&path, 1, &pkts.iter().collect::<Vec<_>>()).unwrap();
+        write_packets(&path, &pkts.iter().collect::<Vec<_>>()).unwrap();
         let h = start(CaptureConfig {
             source: Source::File(path.clone()),
             filter: "udp port 53".into(),

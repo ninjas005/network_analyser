@@ -86,6 +86,14 @@ impl Shell {
             }
         })
         .detach();
+        // "Follow stream" and similar links between the packet tools.
+        let session = crate::session::Session::shared(cx);
+        cx.subscribe_in(
+            &session,
+            window,
+            |this, _, e: &crate::session::OpenTool, window, cx| this.select(e.0, window, cx),
+        )
+        .detach();
         let expanded = match crate::settings::get().sidebar_expanded {
             Some(list) => Segment::ALL
                 .into_iter()

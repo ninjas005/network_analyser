@@ -43,6 +43,8 @@ pub struct Settings {
     pub mqtt_key: String,
     /// Sidebar segments left expanded (labels); `None` = first run.
     pub sidebar_expanded: Option<Vec<String>>,
+    /// Capture files opened lately, newest first (paths).
+    pub recent_captures: Vec<String>,
 }
 
 impl Default for Settings {
@@ -59,6 +61,7 @@ impl Default for Settings {
             mqtt_cert: String::new(),
             mqtt_key: String::new(),
             sidebar_expanded: None,
+            recent_captures: Vec::new(),
         }
     }
 }

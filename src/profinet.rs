@@ -788,7 +788,7 @@ pub fn cli(args: &[String]) {
                     std::process::exit(1)
                 }
                 CaptureEvent::Stopped(None) => break,
-                CaptureEvent::Stats { .. } => {}
+                CaptureEvent::Stats { .. } | CaptureEvent::FileInfo(_) => {}
             }
         }
         if sent_at.is_some_and(|t| t.elapsed() >= Duration::from_secs(wait)) {

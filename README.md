@@ -8,7 +8,7 @@ sidebar:
 |---|---|
 | **Network Discovery** | LAN Scan · Gateway Discovery · Traceroute · DNS Lookup · Reverse DNS · DHCP Analyser · Wake-on-LAN |
 | **Ports & Services** | Port Scan · Service Versions · TLS Certificates · SNMP · NTP Analyser · SFTP / SSH Tester · DHCP Client Tester · DNS Client Tester |
-| **Packet Analysis** | Packet Capture (live or `.pcap`, decoding, traffic analysis) |
+| **Packet Analysis** | Live Packet Capture · PCAP / PCAPNG Viewer · Protocol Decoder · TCP Streams · HTTP Reconstruction · TCP Handshakes · DNS Monitor · Packet Statistics |
 | **Industrial Protocols** | Modbus RTU / TCP · CAN Bus Analyser · PROFINET · BACnet · OPC UA |
 | **IoT Protocols** | MQTT · WebSocket |
 | **Serial Communication** | Serial Monitor |
@@ -58,22 +58,76 @@ Only scan hosts you own or are authorised to test.
 
 ## Packet Capture
 
-- Pick an interface (the one with the default route is preselected), optionally a BPF
-  capture filter (`tcp port 502`, `host 10.0.0.5`, `not arp`), and press **Start**.
-  *Promiscuous* captures frames for other hosts too; *Save to .pcap* writes everything to
-  `~/capture-<timestamp>.pcap` while capturing.
-- Or type the path of a `.pcap` / `.pcapng` file and press **Open .pcap**.
-- The display filter matches protocol, addresses, ports and the info column; every term must
-  match and `!term` excludes (`modbus 10.0.0.20`, `!arp !mdns`). **Save shown as .pcap** writes
-  the filtered packets.
-- Click a packet for its decoded layers and hex dump. Decoded: Ethernet/VLAN/LLC, Linux
-  cooked, loopback, raw IP, ARP, IPv4/IPv6, ICMP/ICMPv6, IGMP, TCP, UDP, DNS/mDNS/LLMNR, DHCP,
-  NTP, SSDP, NBNS, HTTP, TLS (with SNI), SSH, MQTT, SNMP, QUIC and **Modbus/TCP** (function,
-  addresses, values, exceptions).
-- **Analysis**: totals, rate and throughput, protocol breakdown, top talkers and
-  conversations.
+The **Packet Analysis** tools share one session: start a capture or open a file in any of
+them and look at the same packets in all the others. Links such as *Follow TCP stream*,
+*Handshake* and *Show packet* jump between them.
 
-**Permissions.** Capturing needs raw-socket rights. The same rights are used by the tools that send raw Ethernet frames: PROFINET, DHCP Client Tester, DHCP Analyser and Rogue DHCP Tester. CAN through slcan adapters needs serial-port access (`dialout` group on Linux):
+### Live Packet Capture
+
+- Pick an interface (the one with the default route is preselected), optionally a BPF
+  capture filter (`tcp port 502`, `host 10.0.0.5`, `not arp`), and press **Start capture**.
+- **Stop after** ends the capture by itself: packets, time and/or size (`1000`, `60s`, `5min`,
+  `50MB`). *Headers only* keeps 128 bytes per packet, *Promiscuous* captures frames for other
+  hosts too, and *Save to .pcap* writes everything to `~/capture-<timestamp>.pcap`.
+- The display filter matches protocols (also enclosing ones: `gre`, `vlan`), addresses, ports and
+  the info column; every term must match and `!term` excludes (`modbus 10.0.0.20`, `!arp !mdns`).
+  **Save shown** writes the filtered packets.
+- Click a packet for its decoded layers and hex dump. The list keeps 200,000 packets;
+  statistics and handshakes keep counting beyond that.
+
+### PCAP / PCAPNG Viewer
+
+Opens `.pcap` (either byte order, µs or ns), `.pcapng` and gzip-compressed files with a native
+reader: no capture rights or Npcap needed (only a BPF filter needs them). pcapng files with several
+interfaces and link types work, packet comments are shown, and *File details* lists the format,
+host, capture application, interfaces (snap length, filter, drops), names and block types. Damaged
+or cut-off files are read up to the damage. Recent files are listed; `--open FILE` opens one on start.
+
+### Protocol Decoder
+
+Identifies protocols by **content signature** first, so services on unusual ports are
+recognised, and by port otherwise; each packet says which. The protocol tree filters the list.
+*Paste hex* decodes a frame from Wireshark, `tcpdump -x`, `xxd` or `hexdump -C` output.
+
+Decoded: Ethernet, VLAN, MPLS, PPPoE, STP, LLDP, Linux cooked, loopback, raw IP, ARP, IPv4/IPv6,
+GRE, IP-in-IP, VXLAN, ICMP (with the packet that caused the error) and ICMPv6, IGMP, TCP with
+options, UDP, DNS/mDNS/LLMNR, DHCP, DHCPv6, NTP, SSDP, NBNS, HTTP, TLS (SNI, ALPN, versions, cipher,
+TLS 1.2 certificate, alerts), DTLS, QUIC, SSH, SMB, RDP, MQTT, SNMP, CoAP, SIP, RTSP, STUN,
+WireGuard, RADIUS, TFTP, BGP, AMQP, Redis, MySQL, PostgreSQL, VNC and, for industrial networks,
+Modbus, S7comm, OPC UA, EtherNet/IP, DNP3, IEC 104 and BACnet.
+
+### TCP Streams
+
+Reassembles both directions of every connection: segments are put in order, retransmissions and
+overlaps removed, and data missing from the capture is marked instead of being skipped silently.
+Follow the conversation as text or hex, one or both directions, and save the raw bytes.
+
+### HTTP Reconstruction
+
+Pairs HTTP/1.x requests with their responses on any port, joins chunked bodies and decodes gzip and
+deflate (Brotli and zstd are shown raw). Shows headers, bodies, waiting and total time; bodies
+can be saved and requests copied as `curl`. HTTPS, HTTP/2 and HTTP/3 content is not reconstructed.
+
+### TCP Handshakes
+
+Result of every connection attempt (complete, refused, no answer, half-open…), round trip to the server
+and to the client, SYN retransmissions, MSS / window scale / SACK of both sides, how the connection ended,
+and findings such as missing window scaling, zero windows, retransmission rate and possible SYN floods.
+
+### DNS Monitor
+
+Matches queries with their answers: response time, result, repeated and unanswered queries, and totals per
+name, DNS server and client. Flags two different answers to one query (spoofing), failing servers,
+NXDOMAIN bursts and names that look like DNS tunnelling. DNS over TLS / HTTPS is encrypted and not visible.
+
+### Packet Statistics
+
+Totals, average and peak rates, traffic over time, protocol distribution and hierarchy, packet sizes,
+unicast / multicast / broadcast, TCP flags, top talkers, service ports and conversations.
+
+### Permissions
+
+Capturing needs raw-socket rights. The same rights are used by the tools that send raw Ethernet frames: PROFINET, DHCP Client Tester, DHCP Analyser and Rogue DHCP Tester. CAN through slcan adapters needs serial-port access (`dialout` group on Linux):
 
 | OS | Setup |
 |---|---|
@@ -307,7 +361,7 @@ on Linux, `shasum -a 256 <file>` on macOS, or `Get-FileHash <file>` in Windows P
 | Windows 10/11 x64 (installer) | `network-analyser-<version>-windows-x86_64-setup.exe` |
 | Windows 10/11 x64 (portable) | `network-analyser-<version>-windows-x86_64.zip` |
 
-The LAN Scan, Port Scan and Modbus TCP tabs work right after installing. **Packet Capture** and
+The LAN Scan, Port Scan and Modbus TCP tabs work right after installing. **Live Packet Capture** and
 **Serial / Modbus RTU** need the one-time permission steps listed for your system below.
 
 ### Linux: Debian / Ubuntu / Mint / Pop!_OS
@@ -504,7 +558,7 @@ cargo build --release
    machines without Npcap.
 
 Run the tests with `cargo test`. Serial and Modbus RTU tests use pseudo-terminals on Unix; the
-capture test is skipped when Npcap is not installed.
+BPF filter test is skipped when Npcap is not installed.
 
 ## Releasing
 
@@ -532,7 +586,12 @@ network_analyser --cli [RANGE]  # headless, prints a table
 network_analyser --tool dns     # open a tool (lan, gateway, traceroute, dns, rdns, dhcp, wol,
                                 # ports, capture, modbus, serial, netconfig, publicip, geoip, base64,
                                 # snmp, ntp, sftp, dhcp-client, dns-client, can, profinet, bacnet,
-                                # opcua, mqtt, websocket, …)
+                                # opcua, mqtt, websocket, pcap, decode, streams, http,
+                                # handshake, dns-monitor, packet-stats, …)
+network_analyser --open trace.pcapng             # open a capture file
+network_analyser --pcap trace.pcapng http        # headless: info, packets, decode N, streams, follow N,
+                                # http, http-body N, handshakes, dns, stats (-f BPF, -d DISPLAY-FILTER)
+network_analyser --capture eth0 -t 30 -w out.pcap -f 'port 502'   # headless live capture
 network_analyser --dns example.com MX @1.1.1.1   # headless DNS query (an IP = PTR lookup)
 network_analyser --trace 8.8.8.8                 # headless traceroute
 network_analyser --gateway      # headless gateway / NAT / DNS report
@@ -611,7 +670,13 @@ match, so `raspberry 22` finds Raspberry Pis with SSH open.
 - `src/widgets.rs` – palette, buttons, chips, text input, table cells
 - `src/ui.rs` – LAN Scan tab (toolbar, table, details, status bar)
 - `src/portscan.rs`, `src/portscan_view.rs` – remote TCP port scanner and its tab
-- `src/capture.rs`, `src/dissect.rs`, `src/capture_view.rs` – pcap capture thread, packet dissector, capture/analysis tab
+- `src/capture.rs`, `src/pcapfile.rs` – live capture thread; native pcap / pcapng reader and writer
+- `src/dissect.rs`, `src/appproto.rs` – packet dissector; application protocol identification and decoding
+- `src/session.rs` – capture session shared by the packet-analysis tools
+- `src/streams.rs`, `src/httpstream.rs` – TCP tracking, handshakes and reassembly; HTTP reconstruction
+- `src/dnsmon.rs`, `src/pktstats.rs` – DNS transactions; packet statistics
+- `src/capture_view.rs`, `src/flows_view.rs`, `src/dnsmon_view.rs`, `src/pktstats_view.rs` – packet-analysis views
+- `src/pcap_cli.rs` – headless `--pcap` and `--capture`
 - `src/serial.rs`, `src/serial_view.rs` – serial enumeration, monitor thread, baud detection, Serial tab
 - `src/modbus.rs`, `src/modbus_view.rs` – Modbus RTU/TCP framing, CRC, master thread, scans, passive decoder, Modbus tab
 - `src/scanner.rs` – scan engine (own thread + tokio), fingerprinting

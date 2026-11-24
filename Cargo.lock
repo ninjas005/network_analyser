@@ -3938,11 +3938,12 @@ dependencies = [
 
 [[package]]
 name = "network_analyser"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "aes 0.9.4",
  "base64",
  "dns-lookup",
+ "flate2",
  "futures",
  "getrandom 0.4.3",
  "gpui",

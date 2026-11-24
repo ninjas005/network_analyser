@@ -436,7 +436,53 @@ mod tests {
                 eth_src: Some("02:00:00:00:00:01".into()),
                 ..Default::default()
             },
+            ..Default::default()
         }
+    }
+
+    /// Through the capture engine, as the Anomaly Detector receives packets.
+    #[test]
+    fn clear_text_basic_login() {
+        use crate::capture::{CaptureConfig, CaptureEvent, Source, start, write_packets};
+        let f = crate::streams::tests::frame(
+            true,
+            1,
+            1,
+            0x18,
+            b"GET / HTTP/1.1\r\nHost: plc\r\nAuthorization: Basic YTpi\r\n\r\n",
+        );
+        let p = Packet {
+            ts: 1.0,
+            len: f.len() as u32,
+            linktype: 1,
+            data: f,
+            ..Default::default()
+        };
+        let path = std::env::temp_dir().join(format!("na-basic-{}.pcap", std::process::id()));
+        write_packets(&path, &[&p]).unwrap();
+        let h = start(CaptureConfig {
+            source: Source::File(path.clone()),
+            filter: String::new(),
+            save_to: None,
+        });
+        let mut d = Detector::new();
+        let mut alerts = Vec::new();
+        while let Ok(ev) = h.events.recv_timeout(Duration::from_secs(5)) {
+            match ev {
+                CaptureEvent::Packets(ps) => {
+                    for p in &ps {
+                        alerts.extend(d.feed(p, 1, Instant::now()));
+                    }
+                }
+                CaptureEvent::Stopped(_) => break,
+                _ => {}
+            }
+        }
+        std::fs::remove_file(&path).ok();
+        assert!(
+            alerts.iter().any(|a| a.text.contains("HTTP Basic")),
+            "{alerts:?}"
+        );
     }
 
     #[test]

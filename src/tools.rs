@@ -63,6 +63,13 @@ pub enum Tool {
     DhcpClient,
     DnsClient,
     Capture,
+    PcapViewer,
+    ProtoDecode,
+    TcpStreams,
+    HttpStreams,
+    Handshake,
+    DnsMonitor,
+    PacketStats,
     Modbus,
     CanBus,
     Profinet,
@@ -92,7 +99,7 @@ pub enum Tool {
 
 impl Tool {
     /// Sidebar order (grouped by segment).
-    pub const ALL: [Tool; 41] = [
+    pub const ALL: [Tool; 48] = [
         Tool::LanScan,
         Tool::Gateway,
         Tool::Traceroute,
@@ -109,6 +116,13 @@ impl Tool {
         Tool::DhcpClient,
         Tool::DnsClient,
         Tool::Capture,
+        Tool::PcapViewer,
+        Tool::ProtoDecode,
+        Tool::TcpStreams,
+        Tool::HttpStreams,
+        Tool::Handshake,
+        Tool::DnsMonitor,
+        Tool::PacketStats,
         Tool::Modbus,
         Tool::CanBus,
         Tool::Profinet,
@@ -166,7 +180,14 @@ impl Tool {
             | Tool::PacketLoss
             | Tool::Wifi
             | Tool::Uptime => Segment::Performance,
-            Tool::Capture => Segment::PacketAnalysis,
+            Tool::Capture
+            | Tool::PcapViewer
+            | Tool::ProtoDecode
+            | Tool::TcpStreams
+            | Tool::HttpStreams
+            | Tool::Handshake
+            | Tool::DnsMonitor
+            | Tool::PacketStats => Segment::PacketAnalysis,
             Tool::Modbus | Tool::CanBus | Tool::Profinet | Tool::Bacnet | Tool::OpcUa => {
                 Segment::Industrial
             }
@@ -212,7 +233,14 @@ impl Tool {
             Tool::PacketLoss => "Packet Loss Tester",
             Tool::Wifi => "Wi-Fi Analyser",
             Tool::Uptime => "Uptime Monitor",
-            Tool::Capture => "Packet Capture",
+            Tool::Capture => "Live Packet Capture",
+            Tool::PcapViewer => "PCAP / PCAPNG Viewer",
+            Tool::ProtoDecode => "Protocol Decoder",
+            Tool::TcpStreams => "TCP Streams",
+            Tool::HttpStreams => "HTTP Reconstruction",
+            Tool::Handshake => "TCP Handshakes",
+            Tool::DnsMonitor => "DNS Monitor",
+            Tool::PacketStats => "Packet Statistics",
             Tool::Modbus => "Modbus RTU / TCP",
             Tool::Serial => "Serial Monitor",
             Tool::NetConfig => "Network Configuration",
@@ -262,7 +290,14 @@ impl Tool {
             Tool::PacketLoss => "Loss rate and loss bursts over a long probe series",
             Tool::Wifi => "Nearby networks, signal, channel congestion and recommendations",
             Tool::Uptime => "Watch hosts and services; outage log and availability",
-            Tool::Capture => "Capture or open .pcap files, decode and analyse traffic",
+            Tool::Capture => "Capture packets live with filters, limits and decoding",
+            Tool::PcapViewer => "Open .pcap / .pcapng files (also gzip): packets and file details",
+            Tool::ProtoDecode => "Identify protocols by content or port; decode pasted hex",
+            Tool::TcpStreams => "Reassemble TCP streams and follow conversations",
+            Tool::HttpStreams => "Rebuild HTTP requests and responses with decoded bodies",
+            Tool::Handshake => "TCP handshake results, round trips, options and health",
+            Tool::DnsMonitor => "DNS queries with answers, times, failures and totals",
+            Tool::PacketStats => "Protocol distribution, traffic over time, sizes, talkers",
             Tool::Modbus => "Modbus TCP / RTU master: read, poll, write, discover",
             Tool::Serial => "Serial port monitor, sender, Modbus RTU decoder, baud detection",
             Tool::NetConfig => "Interfaces, addresses, routes, DNS servers and neighbours",
@@ -310,6 +345,13 @@ impl Tool {
             Tool::Wifi => "wifi",
             Tool::Uptime => "uptime",
             Tool::Capture => "capture",
+            Tool::PcapViewer => "pcap",
+            Tool::ProtoDecode => "decode",
+            Tool::TcpStreams => "streams",
+            Tool::HttpStreams => "http",
+            Tool::Handshake => "handshake",
+            Tool::DnsMonitor => "dns-monitor",
+            Tool::PacketStats => "packet-stats",
             Tool::Modbus => "modbus",
             Tool::Serial => "serial",
             Tool::NetConfig => "netconfig",
@@ -333,6 +375,7 @@ impl Tool {
                 "ssh" => Some(Tool::Sftp),
                 "ws" => Some(Tool::WebSocket),
                 "canbus" => Some(Tool::CanBus),
+                "pcapng" => Some(Tool::PcapViewer),
                 "opc-ua" => Some(Tool::OpcUa),
                 _ => None,
             })
@@ -402,7 +445,20 @@ pub fn create(
         Tool::Uptime => make(cx, |cx| {
             monitor_view::MonitorView::new(monitor_view::Purpose::Uptime, window, cx)
         }),
-        Tool::Capture => make(cx, |cx| capture_view::CaptureView::new(window, cx)),
+        Tool::Capture => make(cx, |cx| {
+            capture_view::CaptureView::new(capture_view::Kind::Live, window, cx)
+        }),
+        Tool::PcapViewer => make(cx, |cx| {
+            capture_view::CaptureView::new(capture_view::Kind::File, window, cx)
+        }),
+        Tool::ProtoDecode => make(cx, |cx| {
+            capture_view::CaptureView::new(capture_view::Kind::Decode, window, cx)
+        }),
+        Tool::TcpStreams => make(cx, |cx| flows_view::StreamsView::new(window, cx)),
+        Tool::HttpStreams => make(cx, |cx| flows_view::HttpView::new(window, cx)),
+        Tool::Handshake => make(cx, |cx| flows_view::HandshakeView::new(window, cx)),
+        Tool::DnsMonitor => make(cx, |cx| dnsmon_view::DnsMonView::new(window, cx)),
+        Tool::PacketStats => make(cx, |cx| pktstats_view::PacketStatsView::new(window, cx)),
         Tool::Modbus => make(cx, |cx| modbus_view::ModbusView::new(window, cx)),
         Tool::Serial => make(cx, |cx| serial_view::SerialView::new(window, cx)),
         Tool::NetConfig => make(cx, |cx| netconfig_view::NetConfigView::new(window, cx)),

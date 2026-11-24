@@ -276,7 +276,7 @@ fn svc_params(p: &[u8], mut pos: usize, end: usize) -> String {
 }
 
 /// Presentation form of the RDATA at `pos..pos+len`.
-fn rdata(p: &[u8], rtype: u16, pos: usize, len: usize) -> String {
+pub fn rdata(p: &[u8], rtype: u16, pos: usize, len: usize) -> String {
     let end = pos + len;
     let Some(d) = p.get(pos..end) else {
         return "<truncated>".into();
@@ -409,7 +409,7 @@ fn rdata(p: &[u8], rtype: u16, pos: usize, len: usize) -> String {
 }
 
 /// UTC date from a 32-bit Unix timestamp (RRSIG times).
-fn unix_date(t: u32) -> String {
+pub fn unix_date(t: u32) -> String {
     let days = t as i64 / 86400;
     // Civil-from-days (Howard Hinnant).
     let z = days + 719468;
