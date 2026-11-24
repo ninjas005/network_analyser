@@ -37,6 +37,12 @@ pub struct Settings {
     pub speed_url: String,
     /// Authorised DHCP servers for the rogue DHCP tester.
     pub dhcp_servers: Vec<String>,
+    /// MQTT certificate files (paths only; the key itself is not copied).
+    pub mqtt_ca: String,
+    pub mqtt_cert: String,
+    pub mqtt_key: String,
+    /// Sidebar segments left expanded (labels); `None` = first run.
+    pub sidebar_expanded: Option<Vec<String>>,
 }
 
 impl Default for Settings {
@@ -49,6 +55,10 @@ impl Default for Settings {
             firewall_host: DEFAULT_FIREWALL_HOST.into(),
             speed_url: DEFAULT_SPEED_URL.into(),
             dhcp_servers: Vec::new(),
+            mqtt_ca: String::new(),
+            mqtt_cert: String::new(),
+            mqtt_key: String::new(),
+            sidebar_expanded: None,
         }
     }
 }

@@ -4,7 +4,7 @@
 //! small SHA-1 used by the IoT tools.
 
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
@@ -73,7 +73,10 @@ pub fn io_err(e: &io::Error) -> String {
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => "timeout".into(),
         io::ErrorKind::ConnectionRefused => "connection refused".into(),
         io::ErrorKind::ConnectionReset => "connection reset by the server".into(),
-        io::ErrorKind::UnexpectedEof => "connection closed by the server".into(),
+        io::ErrorKind::ConnectionAborted => "connection aborted".into(),
+        io::ErrorKind::UnexpectedEof | io::ErrorKind::BrokenPipe => {
+            "connection closed by the server".into()
+        }
         _ => e.to_string(),
     }
 }
@@ -103,37 +106,28 @@ pub fn open(
     insecure: bool,
     wait: Duration,
 ) -> Result<(NetStream, ConnInfo), String> {
-    let addr = (host, port)
-        .to_socket_addrs()
-        .map_err(|e| format!("cannot resolve {host}: {e}"))?
-        .next()
-        .ok_or_else(|| format!("{host}: no address"))?;
     let t0 = Instant::now();
-    let mut info = ConnInfo {
-        addr: Some(addr),
-        ..Default::default()
-    };
+    let mut info = ConnInfo::default();
     if !tls {
-        let s = TcpStream::connect_timeout(&addr, wait)
-            .map_err(|e| format!("{addr}: {}", io_err(&e)))?;
+        let (s, addr) = crate::tls::connect(host, port, wait)?;
+        info.addr = Some(addr);
         info.connect_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        s.set_read_timeout(Some(wait)).ok();
-        s.set_write_timeout(Some(wait)).ok();
         s.set_nodelay(true).ok();
         return Ok((NetStream::Plain(s), info));
     }
     let sni = host.trim_start_matches('[').trim_end_matches(']');
     let stream = if insecure {
         // Verify separately so the problem can be shown.
-        if let Err(e) = crate::tls::connect_tls(sni, port, wait).and_then(|mut s| {
-            while s.conn.is_handshaking() {
-                s.conn.complete_io(&mut s.sock).map_err(|e| io_err(&e))?;
+        let mut probe = crate::tls::connect_tls(sni, port, wait)?;
+        let ip = probe.sock.peer_addr().map_err(|e| io_err(&e))?.ip();
+        while probe.conn.is_handshaking() {
+            if let Err(e) = probe.conn.complete_io(&mut probe.sock) {
+                info.cert_error = Some(io_err(&e));
+                break;
             }
-            Ok(())
-        }) {
-            info.cert_error = Some(e);
         }
-        let (s, _) = crate::tls::connect_insecure(sni, addr.ip(), port, wait)?;
+        drop(probe);
+        let (s, _) = crate::tls::connect_insecure(sni, ip, port, wait)?;
         s
     } else {
         let mut s = crate::tls::connect_tls(sni, port, wait)?;
@@ -144,6 +138,7 @@ pub fn open(
         }
         s
     };
+    info.addr = stream.sock.peer_addr().ok();
     info.connect_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let v = match stream.conn.protocol_version() {
         Some(rustls::ProtocolVersion::TLSv1_3) => "TLS 1.3",

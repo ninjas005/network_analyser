@@ -39,6 +39,7 @@ mod netinfo;
 mod ntp;
 mod ntp_view;
 mod opcua;
+mod opcua_crypto;
 mod opcua_view;
 mod perf_view;
 mod platform;
@@ -152,9 +153,15 @@ OPTIONS:
     --bacnet [TARGET] [--range LOW-HIGH] [--wait S] [--objects]
                   BACnet/IP Who-Is discovery, device properties, optional object list
     --opcua opc.tcp://HOST[:4840][/PATH] [browse]
-                  OPC UA endpoints and security review; 'browse' opens an anonymous session
-    --mqtt BROKER [TOPIC-FILTER] [SECONDS]
-                  Subscribe and print messages (mqtt://, mqtts://, host[:port])
+            [--policy NAME --mode sign|encrypt] [--user U --password P]
+            [--user-cert FILE --user-key FILE] [--cert FILE --key FILE] [--trust]
+                  OPC UA endpoints and security review; 'browse' or --policy opens a
+                  session (--trust saves the server certificate; --cert/--key = own
+                  client certificate, else a built-in one is created)
+    --mqtt BROKER [TOPIC-FILTER] [SECONDS] [--user U --password P]
+           [--ca CA.pem] [--cert CLIENT.pem --key CLIENT.key] [--insecure]
+                  Subscribe and print messages (mqtt://, mqtts://, host[:port]);
+                  --cert/--key = mutual TLS
     --ws URL [MESSAGE]
                   WebSocket handshake, send a message and a ping, print frames
     --list-ifaces List packet-capture interfaces
@@ -372,7 +379,7 @@ fn run_gui(mode: Mode, autoscan: bool, tab: Tool, update_check: bool) {
                         v
                     });
                     cx.new(|cx| {
-                        let mut shell = Shell::new(kiosk, lan, update_check, cx);
+                        let mut shell = Shell::new(kiosk, lan, update_check, window, cx);
                         shell.select(tab, window, cx);
                         shell
                     })

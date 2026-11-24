@@ -19,7 +19,9 @@ sidebar:
 Coming next: more industrial and IoT protocols (CAN bus, PROFINET, BACnet, OPC UA, MQTT, SNMP,
 NTP, WebSocket, SFTP, DHCP / DNS client testers).
 
-Click a tool in the sidebar, or use **Alt+↑ / Alt+↓** to move between tools. **Ctrl+B**
+Click a tool in the sidebar, or use **Alt+↑ / Alt+↓** to move between tools. Click a group
+header to collapse or expand it (or use *Expand all* / *Collapse all*); the box at the top
+filters tools by name or purpose, and Enter opens the first match. Open groups are remembered. **Ctrl+B**
 (**⌘B**) hides the sidebar. `--tool NAME` opens a tool directly (see [Run](#run)).
 
 ## LAN Scan
@@ -201,11 +203,19 @@ Devices can be saved, and any device from the last LAN Scan can be picked by cli
   manual ReadProperty form.
 - **OPC UA**: a server's endpoints, security policies and login types, with insecure setups
   flagged (no security, anonymous access, clear-text passwords, deprecated policies, certificate
-  problems). Then an anonymous or user-name session (SecurityPolicy None) to browse the address
-  space, read node attributes and watch live values.
+  problems). Connects on any endpoint: unsecured, Sign or SignAndEncrypt (Basic256Sha256,
+  Aes128_Sha256_RsaOaep, Aes256_Sha256_RsaPss; Basic256 and Basic128Rsa15 marked deprecated), as
+  anonymous, with a user name and encrypted password, or with an X.509 user certificate. It
+  creates its own client certificate on first use (or uses yours); the server's administrator
+  must trust it after the first attempt. You trust the server's certificate once and are warned
+  if it changes. Then browse the address space, read node attributes and watch live values.
 - **MQTT**: an MQTT 3.1.1 / 5.0 client over TCP or TLS. Subscribe with wildcards and watch a live
   topic tree with counts, rates and payloads (text, JSON or hex); publish at QoS 0 / 1 / 2 with
   retain; broker statistics from `$SYS`; a connection log with reason codes explained.
+  Authentication is either **username / password** or **certificates (mutual TLS)**: a CA
+  certificate (optional; the system store otherwise), a client certificate and its private key
+  (PEM or DER; PKCS#8, RSA or EC keys). TLS failures such as an untrusted client certificate,
+  a missing one, or a broker using an old X.509 v1 certificate are explained in the log.
 - **WebSocket**: `ws://` and `wss://` with custom headers, subprotocols and Origin; shows the
   upgrade request and response; send text, binary or pings and follow a frame log with ping
   round-trip times and explained close codes.
@@ -542,7 +552,9 @@ network_analyser --can can0                     # candump-style monitor (or slca
 network_analyser --profinet eth0                # PROFINET DCP Identify All
 network_analyser --bacnet --objects             # BACnet/IP Who-Is and device details
 network_analyser --opcua opc.tcp://plc:4840 browse
+network_analyser --opcua opc.tcp://plc:4840 --policy Basic256Sha256 --mode encrypt --user op --password …
 network_analyser --mqtt mqtts://broker:8883 'sensors/#' 30
+network_analyser --mqtt broker:8883 '#' 30 --ca ca.pem --cert client.pem --key client.key
 network_analyser --ws wss://echo.websocket.org hello
 network_analyser --list-ifaces  # capture interfaces
 network_analyser --list-serial  # serial ports

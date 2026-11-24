@@ -1,15 +1,21 @@
-//! OPC UA client (UA Binary over opc.tcp, SecurityPolicy None), hand-rolled:
-//! HEL/ACK, secure channel (OPN/CLO, renew, chunking), GetEndpoints,
-//! FindServers, CreateSession/ActivateSession (anonymous or user name),
-//! Browse/BrowseNext, Read, CloseSession; endpoint security assessment;
-//! a session worker for the UI and the headless `--opcua`.
+//! OPC UA client (UA Binary over opc.tcp), hand-rolled: HEL/ACK, secure
+//! channel (OPN/CLO, renew, chunking) with SecurityPolicy None or a signed /
+//! encrypted policy (see `opcua_crypto`), GetEndpoints, FindServers,
+//! CreateSession/ActivateSession (anonymous, user name with an encrypted
+//! password, or an X.509 user certificate), Browse/BrowseNext, Read,
+//! CloseSession; endpoint security assessment; a session worker for the UI
+//! and the headless `--opcua`.
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream};
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
+use rsa::{PrivateKey, PublicKey};
+
 use crate::gateway::{Finding, Level};
+use crate::opcua_crypto::{self as uac, ClientIdentity, Keys, Local, Policy};
 
 // ---------------------------------------------------------------- ids
 
@@ -38,6 +44,7 @@ mod id {
     pub const READ_RESP: u32 = 634;
     pub const ANONYMOUS_TOKEN: u32 = 321;
     pub const USERNAME_TOKEN: u32 = 324;
+    pub const X509_TOKEN: u32 = 327;
 }
 
 /// Well-known nodes.
@@ -686,7 +693,16 @@ pub fn status_name(code: u32) -> String {
         0x8012_0000 => "BadCertificateInvalid",
         0x8013_0000 => "BadSecurityChecksFailed",
         0x8014_0000 => "BadCertificateTimeInvalid",
+        0x8015_0000 => "BadCertificateIssuerTimeInvalid",
+        0x8016_0000 => "BadCertificateHostNameInvalid",
+        0x8017_0000 => "BadCertificateUriInvalid",
+        0x8018_0000 => "BadCertificateUseNotAllowed",
+        0x8019_0000 => "BadCertificateIssuerUseNotAllowed",
         0x801A_0000 => "BadCertificateUntrusted",
+        0x801B_0000 => "BadCertificateRevocationUnknown",
+        0x801C_0000 => "BadCertificateIssuerRevocationUnknown",
+        0x801D_0000 => "BadCertificateRevoked",
+        0x801E_0000 => "BadCertificateIssuerRevoked",
         0x801F_0000 => "BadUserAccessDenied",
         0x8020_0000 => "BadIdentityTokenInvalid",
         0x8021_0000 => "BadIdentityTokenRejected",
@@ -713,6 +729,8 @@ pub fn status_name(code: u32) -> String {
         0x8054_0000 => "BadSecurityModeRejected",
         0x8055_0000 => "BadSecurityPolicyRejected",
         0x8056_0000 => "BadTooManySessions",
+        0x8057_0000 => "BadUserSignatureInvalid",
+        0x8058_0000 => "BadApplicationSignatureInvalid",
         0x807E_0000 => "BadTcpServerTooBusy",
         0x807F_0000 => "BadTcpMessageTypeInvalid",
         0x8080_0000 => "BadTcpSecureChannelUnknown",
@@ -1108,6 +1126,26 @@ fn err_text(body: &[u8]) -> String {
     )
 }
 
+/// Security for a signed / encrypted channel.
+#[derive(Clone)]
+pub struct Security {
+    pub policy: Policy,
+    /// 2 Sign, 3 SignAndEncrypt
+    pub mode: u32,
+    pub identity: ClientIdentity,
+    /// The server's certificate (from the endpoint description).
+    pub server_cert: Vec<u8>,
+}
+
+struct SecState {
+    s: Security,
+    server_key: PublicKey,
+}
+
+/// Symmetric keys of one security token: (token id, client→server,
+/// server→client).
+type TokenKeys = (u32, Keys, Keys);
+
 pub struct Client {
     s: TcpStream,
     pub addr: SocketAddr,
@@ -1123,22 +1161,47 @@ pub struct Client {
     lifetime_ms: u32,
     timeout: Duration,
     pub connect_ms: f64,
+    sec: Option<SecState>,
+    /// Newest last; the previous token is kept for late server messages.
+    keys: Vec<TokenKeys>,
+    /// Last server nonce of the session (CreateSession / ActivateSession).
+    server_nonce: Vec<u8>,
+    /// Server certificate from CreateSession (for user token encryption).
+    session_cert: Vec<u8>,
 }
 
 impl Client {
     pub fn connect(url: &str, timeout: Duration) -> Res<Client> {
+        Client::connect_with(url, timeout, None)
+    }
+
+    /// Connect and open a secure channel (`None` = SecurityPolicy None).
+    pub fn connect_with(url: &str, timeout: Duration, security: Option<Security>) -> Res<Client> {
+        let sec = match security {
+            Some(s) if s.policy != Policy::None => {
+                if !(2..=3).contains(&s.mode) {
+                    return Err("security mode must be Sign or SignAndEncrypt".into());
+                }
+                if s.server_cert.is_empty() {
+                    return Err("the endpoint has no server certificate".into());
+                }
+                let server_key = uac::cert_public_key(&s.server_cert)?;
+                let bits = rsa::traits::PublicKeyParts::size(&s.identity.key) * 8;
+                let (lo, hi) = s.policy.key_bits();
+                if bits < lo || bits > hi {
+                    return Err(format!(
+                        "{} needs a {lo}–{hi}-bit client key; this certificate has {bits} bits",
+                        s.policy.name()
+                    ));
+                }
+                Some(SecState { s, server_key })
+            }
+            _ => None,
+        };
         let (host, port) = parse_url(url)?;
-        let addr = (host.as_str(), port)
-            .to_socket_addrs()
-            .map_err(|e| format!("cannot resolve {host}: {e}"))?
-            .next()
-            .ok_or_else(|| format!("{host}: no address"))?;
         let t0 = Instant::now();
-        let s = TcpStream::connect_timeout(&addr, timeout)
-            .map_err(|e| format!("{addr}: {}", crate::websocket::io_err(&e)))?;
+        let (s, addr) = crate::tls::connect(&host, port, timeout)?;
         let connect_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        s.set_read_timeout(Some(timeout)).ok();
-        s.set_write_timeout(Some(timeout)).ok();
         s.set_nodelay(true).ok();
         let mut c = Client {
             s,
@@ -1155,6 +1218,10 @@ impl Client {
             lifetime_ms: 3_600_000,
             timeout,
             connect_ms,
+            sec,
+            keys: Vec::new(),
+            server_nonce: Vec::new(),
+            session_cert: Vec::new(),
         };
         c.write(&hello(url))?;
         let (kind, _, body) = c.read_chunk()?;
@@ -1179,6 +1246,25 @@ impl Client {
         }
         c.open_channel(false)?;
         Ok(c)
+    }
+
+    /// "Basic256Sha256 / SignAndEncrypt" or "None".
+    pub fn security_text(&self) -> String {
+        match &self.sec {
+            Some(st) => format!("{} / {}", st.s.policy.name(), mode_name(st.s.mode)),
+            None => "None".into(),
+        }
+    }
+
+    fn policy(&self) -> Policy {
+        self.sec
+            .as_ref()
+            .map(|s| s.s.policy)
+            .unwrap_or(Policy::None)
+    }
+
+    fn encrypting(&self) -> bool {
+        self.sec.as_ref().is_some_and(|s| s.s.mode == 3)
     }
 
     fn write(&mut self, b: &[u8]) -> Res<()> {
@@ -1224,40 +1310,121 @@ impl Client {
     fn send_request(&mut self, kind: &[u8; 3], body: &[u8]) -> Res<u32> {
         self.req_id += 1;
         let req = self.req_id;
-        let sec: Vec<u8> = if kind == b"OPN" {
-            let mut w = W::default();
-            w.u32(self.channel_id)
-                .string(Some(POLICY_NONE))
-                .bytes(None)
-                .bytes(None);
-            w.0
-        } else {
-            let mut w = W::default();
-            w.u32(self.channel_id).u32(self.token_id);
-            w.0
-        };
+        if kind == b"OPN" {
+            self.seq += 1;
+            let mut payload = self.seq.to_le_bytes().to_vec();
+            payload.extend_from_slice(&req.to_le_bytes());
+            payload.extend_from_slice(body);
+            let f = match &self.sec {
+                Some(st) => uac::seal_asym(
+                    st.s.policy,
+                    b'F',
+                    self.channel_id,
+                    Some(&Local {
+                        cert: &st.s.identity.cert,
+                        key: &st.s.identity.key,
+                    }),
+                    &st.s.server_cert,
+                    Some(&st.server_key),
+                    &payload,
+                )?,
+                None => uac::seal_asym(Policy::None, b'F', 0, None, &[], None, &payload)?,
+            };
+            if f.len() > self.ack.recv_buf.max(8192) as usize {
+                return Err(format!(
+                    "OpenSecureChannel request ({} bytes) exceeds the server's buffer ({})",
+                    f.len(),
+                    self.ack.recv_buf
+                ));
+            }
+            self.write(&f)?;
+            return Ok(req);
+        }
         let limit = if self.ack.recv_buf >= 8192 {
             self.ack.recv_buf as usize
         } else {
             8192
         };
-        let max_body = limit - 8 - sec.len() - 8;
+        let (policy, enc) = (self.policy(), self.encrypting());
+        let max_body = uac::max_sym_body(policy, enc, limit);
         let parts: Vec<&[u8]> = if body.is_empty() {
             vec![body]
         } else {
             body.chunks(max_body).collect()
         };
         let last = parts.len() - 1;
+        let keys = self.keys.last().map(|k| k.1.clone());
         for (i, part) in parts.into_iter().enumerate() {
             self.seq += 1;
-            let mut m = sec.clone();
-            m.extend_from_slice(&self.seq.to_le_bytes());
-            m.extend_from_slice(&req.to_le_bytes());
-            m.extend_from_slice(part);
-            let f = frame(kind, if i == last { b'F' } else { b'C' }, &m);
+            let mut payload = self.seq.to_le_bytes().to_vec();
+            payload.extend_from_slice(&req.to_le_bytes());
+            payload.extend_from_slice(part);
+            let f = uac::seal_sym(
+                policy,
+                enc,
+                kind,
+                if i == last { b'F' } else { b'C' },
+                self.channel_id,
+                self.token_id,
+                keys.as_ref(),
+                &payload,
+            )?;
             self.write(&f)?;
         }
         Ok(req)
+    }
+
+    /// Verify/decrypt a received chunk → sequence header + body.
+    fn open_chunk(&self, kind: &[u8; 3], chunk: u8, body: &[u8]) -> Res<Vec<u8>> {
+        let mut frame = Vec::with_capacity(body.len() + 8);
+        frame.extend_from_slice(kind);
+        frame.push(chunk);
+        frame.extend_from_slice(&((body.len() + 8) as u32).to_le_bytes());
+        frame.extend_from_slice(body);
+        if kind == b"OPN" {
+            let local = self.sec.as_ref().map(|st| Local {
+                cert: &st.s.identity.cert,
+                key: &st.s.identity.key,
+            });
+            let (h, payload) = uac::open_asym(&frame, local.as_ref())?;
+            if self.channel_id != 0 && h.channel_id != self.channel_id {
+                return Err(format!(
+                    "OPN response for channel {} (ours is {})",
+                    h.channel_id, self.channel_id
+                ));
+            }
+            if let Some(st) = &self.sec {
+                if h.policy_uri != st.s.policy.uri() {
+                    return Err(format!(
+                        "the server answered with security policy {}",
+                        policy_short(&h.policy_uri)
+                    ));
+                }
+                if h.sender_cert != st.s.server_cert {
+                    return Err(
+                        "the server signed the channel with a different certificate than its endpoint advertises"
+                            .into(),
+                    );
+                }
+            }
+            return Ok(payload);
+        }
+        if body.len() < 16 {
+            return Err("short chunk".into());
+        }
+        let token = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+        let keys = match &self.sec {
+            Some(_) => Some(
+                self.keys
+                    .iter()
+                    .rev()
+                    .find(|k| k.0 == token)
+                    .map(|k| &k.2)
+                    .ok_or_else(|| format!("message for unknown security token {token}"))?,
+            ),
+            None => None,
+        };
+        uac::open_sym(self.policy(), self.encrypting(), &frame, keys)
     }
 
     /// Receive the full response for `req` (reassembling chunks).
@@ -1272,15 +1439,8 @@ impl Client {
             if &kind == b"ERR" {
                 return Err(err_text(&b));
             }
-            let mut r = R::new(&b);
-            r.u32()?; // channel id
-            if &kind == b"OPN" {
-                r.string()?;
-                r.bytes()?;
-                r.bytes()?;
-            } else {
-                r.u32()?; // token id
-            }
+            let payload = self.open_chunk(&kind, chunk, &b)?;
+            let mut r = R::new(&payload);
             r.u32()?; // sequence number
             let rid = r.u32()?;
             if chunk == b'A' {
@@ -1294,7 +1454,7 @@ impl Client {
             if rid != req {
                 continue; // a late answer to an earlier request
             }
-            body.extend_from_slice(&b[r.pos..]);
+            body.extend_from_slice(&payload[r.pos..]);
             if body.len() > 64 << 20 {
                 return Err("response larger than 64 MiB".into());
             }
@@ -1336,6 +1496,9 @@ impl Client {
     }
 
     fn open_channel(&mut self, renew: bool) -> Res<()> {
+        let policy = self.policy();
+        let mode = self.sec.as_ref().map(|s| s.s.mode).unwrap_or(1);
+        let client_nonce = uac::random(policy.nonce_len());
         let mut w = W::default();
         w.type_id(id::OPN_REQ);
         let saved = std::mem::replace(&mut self.auth, NodeId::null());
@@ -1343,8 +1506,8 @@ impl Client {
         self.auth = saved;
         w.u32(0)
             .u32(renew as u32)
-            .u32(1)
-            .bytes(None)
+            .u32(mode)
+            .bytes((!client_nonce.is_empty()).then_some(&client_nonce[..]))
             .u32(self.lifetime_ms);
         let req = self.send_request(b"OPN", &w.0)?;
         let body = self.recv_response(req)?;
@@ -1353,8 +1516,13 @@ impl Client {
         let result = r.response_header()?;
         if t != NodeId::num(0, id::OPN_RESP) || !is_good(result) {
             return Err(format!(
-                "OpenSecureChannel refused: {} (the server may not offer SecurityPolicy None)",
-                status_name(result)
+                "OpenSecureChannel refused: {}{}",
+                status_name(result),
+                if self.sec.is_none() {
+                    " (the server may not offer SecurityPolicy None)"
+                } else {
+                    ""
+                }
             ));
         }
         r.u32()?;
@@ -1362,6 +1530,23 @@ impl Client {
         self.token_id = r.u32()?;
         r.i64()?;
         self.lifetime_ms = r.u32()?.max(10_000);
+        let server_nonce = r.bytes()?.unwrap_or_default();
+        if self.sec.is_some() {
+            if server_nonce.len() != policy.nonce_len() {
+                return Err(format!(
+                    "server nonce has {} bytes, {} expects {}",
+                    server_nonce.len(),
+                    policy.name(),
+                    policy.nonce_len()
+                ));
+            }
+            let client = uac::derive(policy, &server_nonce, &client_nonce);
+            let server = uac::derive(policy, &client_nonce, &server_nonce);
+            self.keys.push((self.token_id, client, server));
+            if self.keys.len() > 2 {
+                self.keys.remove(0);
+            }
+        }
         self.channel_opened = Instant::now();
         Ok(())
     }
@@ -1393,10 +1578,12 @@ impl Client {
         r.array(app_description)
     }
 
-    /// CreateSession; returns (session id, revised timeout ms).
+    /// CreateSession; returns (session id, revised timeout ms). On a secured
+    /// channel the server's signature over our certificate and nonce is
+    /// verified.
     pub fn create_session(&mut self) -> Res<(NodeId, f64)> {
         let url = self.url.clone();
-        let nonce = crate::websocket::random_bytes(32);
+        let nonce = uac::random(32);
         let name = format!(
             "network-analyser-{}",
             nonce[..3]
@@ -1404,8 +1591,12 @@ impl Client {
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>()
         );
+        let (app_uri, client_cert) = match &self.sec {
+            Some(st) => (st.s.identity.app_uri.clone(), st.s.identity.cert.clone()),
+            None => ("urn:network-analyser:client".to_string(), Vec::new()),
+        };
         let (b, pos) = self.call(id::CREATE_SESSION_REQ, id::CREATE_SESSION_RESP, |w| {
-            w.string(Some("urn:network-analyser:client"))
+            w.string(Some(&app_uri))
                 .string(Some("urn:network-analyser"))
                 .localized("Network Analyser")
                 .u32(1)
@@ -1416,7 +1607,7 @@ impl Client {
                 .string(Some(&url))
                 .string(Some(&name))
                 .bytes(Some(&nonce))
-                .bytes(None)
+                .bytes((!client_cert.is_empty()).then_some(&client_cert[..]))
                 .f64(120_000.0)
                 .u32(0);
         })?;
@@ -1425,11 +1616,58 @@ impl Client {
         let session = r.node_id()?;
         self.auth = r.node_id()?;
         let timeout = r.f64()?;
+        self.server_nonce = r.bytes()?.unwrap_or_default();
+        self.session_cert = r.bytes()?.unwrap_or_default();
+        r.array(endpoint)?;
+        r.array(|r| {
+            r.bytes()?;
+            r.bytes()
+        })?;
+        let alg = r.str()?;
+        let sig = r.bytes()?.unwrap_or_default();
+        if let Some(st) = &self.sec {
+            if self.session_cert != st.s.server_cert {
+                return Err(
+                    "CreateSession returned a different server certificate than the endpoint"
+                        .into(),
+                );
+            }
+            if self.server_nonce.len() < 32 {
+                return Err("the server sent no (or a short) session nonce".into());
+            }
+            let mut data = client_cert.clone();
+            data.extend_from_slice(&nonce);
+            uac::rsa_verify(st.s.policy, &st.server_key, &data, &sig).map_err(|_| {
+                format!(
+                    "BadApplicationSignatureInvalid: the server's session signature ({}) does not verify",
+                    if alg.is_empty() { "none" } else { &alg }
+                )
+            })?;
+        }
         Ok((session, timeout))
     }
 
+    /// Server certificate to encrypt user tokens for.
+    fn token_cert(&self) -> Vec<u8> {
+        match &self.sec {
+            Some(st) => st.s.server_cert.clone(),
+            None => self.session_cert.clone(),
+        }
+    }
+
+    /// ActivateSession with the client signature (secured channels) and the
+    /// identity token (password encrypted per the token's security policy).
     pub fn activate_session(&mut self, identity: &Identity) -> Res<()> {
+        let channel_policy = self.policy();
+        let token_policy = |p: &str| -> Policy {
+            if p.is_empty() {
+                channel_policy
+            } else {
+                Policy::from_uri(p).unwrap_or(channel_policy)
+            }
+        };
         let mut tok = W::default();
+        let mut token_sig: Option<(String, Vec<u8>)> = None;
         let type_id = match identity {
             Identity::Anonymous(policy) => {
                 tok.string(Some(policy));
@@ -1437,26 +1675,86 @@ impl Client {
             }
             Identity::User {
                 policy,
+                security_policy,
                 user,
                 password,
             } => {
-                tok.string(Some(policy))
-                    .string(Some(user))
-                    .bytes(Some(password.as_bytes()))
-                    .string(None);
+                let p = token_policy(security_policy);
+                if p == Policy::None {
+                    tok.string(Some(policy))
+                        .string(Some(user))
+                        .bytes(Some(password.as_bytes()))
+                        .string(None);
+                } else {
+                    let cert = self.token_cert();
+                    if cert.is_empty() {
+                        return Err(
+                            "the server sent no certificate to encrypt the password with".into(),
+                        );
+                    }
+                    let key = uac::cert_public_key(&cert)?;
+                    let mut plain = ((password.len() + self.server_nonce.len()) as u32)
+                        .to_le_bytes()
+                        .to_vec();
+                    plain.extend_from_slice(password.as_bytes());
+                    plain.extend_from_slice(&self.server_nonce);
+                    let enc = uac::rsa_encrypt(p, &key, &plain)?;
+                    tok.string(Some(policy))
+                        .string(Some(user))
+                        .bytes(Some(&enc))
+                        .string(Some(p.enc_algorithm_uri()));
+                }
                 id::USERNAME_TOKEN
             }
+            Identity::Cert {
+                policy,
+                security_policy,
+                cert,
+                key,
+            } => {
+                let p = token_policy(security_policy);
+                if p == Policy::None {
+                    return Err("X.509 user login needs a token security policy to sign with; choose a secured endpoint".into());
+                }
+                let mut data = self.token_cert();
+                data.extend_from_slice(&self.server_nonce);
+                token_sig = Some((
+                    p.sig_algorithm_uri().to_string(),
+                    uac::rsa_sign(p, key, &data)?,
+                ));
+                tok.string(Some(policy)).bytes(Some(cert));
+                id::X509_TOKEN
+            }
+        };
+        let client_sig = match &self.sec {
+            Some(st) => {
+                let mut data = st.s.server_cert.clone();
+                data.extend_from_slice(&self.server_nonce);
+                Some((
+                    st.s.policy.sig_algorithm_uri().to_string(),
+                    uac::rsa_sign(st.s.policy, &st.s.identity.key, &data)?,
+                ))
+            }
+            None => None,
         };
         let (b, pos) = self.call(id::ACTIVATE_SESSION_REQ, id::ACTIVATE_SESSION_RESP, |w| {
-            w.string(None).bytes(None); // client signature
+            match &client_sig {
+                Some((a, s)) => w.string(Some(a)).bytes(Some(s)),
+                None => w.string(None).bytes(None),
+            };
             w.empty_array(); // software certificates
             w.i32(1).string(Some("en"));
             w.type_id(type_id).u8(1).bytes(Some(&tok.0));
-            w.string(None).bytes(None); // token signature
+            match &token_sig {
+                Some((a, s)) => w.string(Some(a)).bytes(Some(s)),
+                None => w.string(None).bytes(None),
+            };
         })?;
         let mut r = R::new(&b);
         r.pos = pos;
-        r.bytes()?;
+        if let Some(n) = r.bytes()?.filter(|n| !n.is_empty()) {
+            self.server_nonce = n;
+        }
         let results = r.array(|r| r.u32())?;
         if let Some(bad) = results.iter().find(|s| !is_good(**s)) {
             return Err(format!("ActivateSession: {}", status_name(*bad)));
@@ -1551,13 +1849,22 @@ fn browse_result(r: &mut R) -> Res<BrowseResult> {
     Ok((status, cont, refs))
 }
 
+/// Identity token for ActivateSession. `policy` is the token's PolicyId,
+/// `security_policy` its SecurityPolicyUri (empty = the channel's).
 #[derive(Clone, Debug)]
 pub enum Identity {
     Anonymous(String),
     User {
         policy: String,
+        security_policy: String,
         user: String,
         password: String,
+    },
+    Cert {
+        policy: String,
+        security_policy: String,
+        cert: Vec<u8>,
+        key: Box<PrivateKey>,
     },
 }
 
@@ -1859,41 +2166,198 @@ pub fn discover(client: &mut Client) -> Res<Discovery> {
     Ok(d)
 }
 
-/// Endpoint and token policy to use for a None-security session.
-pub fn pick_none_endpoint(eps: &[Endpoint], token_type: u32) -> Res<(Endpoint, TokenPolicy)> {
-    let none: Vec<&Endpoint> = eps
+/// Endpoint and user token policy for a session with `policy` / `mode`
+/// (`mode` 0 = the most secure mode offered with that policy).
+pub fn pick_endpoint(
+    eps: &[Endpoint],
+    policy: Policy,
+    mode: u32,
+    token_type: u32,
+) -> Res<(Endpoint, TokenPolicy)> {
+    let uri = policy.uri();
+    let mut matching: Vec<&Endpoint> = eps
         .iter()
-        .filter(|e| e.mode == 1 && e.policy == POLICY_NONE)
+        .filter(|e| e.policy == uri && (policy == Policy::None || mode == 0 || e.mode == mode))
         .collect();
-    if none.is_empty() {
-        return Err("the server offers no SecurityPolicy None endpoint — sessions need signing/encryption, which this tool does not implement (the endpoint list above is still valid)".into());
-    }
-    for e in &none {
-        if let Some(t) = e.tokens.iter().find(|t| t.token_type == token_type) {
-            if token_type == 1
-                && !(t.security_policy.is_empty() || t.security_policy == POLICY_NONE)
-            {
-                return Err(format!(
-                    "the server wants user-name tokens encrypted with {} — not supported here; use anonymous or a client with certificate support",
-                    policy_short(&t.security_policy)
-                ));
+    if matching.is_empty() {
+        if policy == Policy::None {
+            return Err("the server offers no SecurityPolicy None endpoint — press Discover, pick a secured endpoint and trust the server certificate".into());
+        }
+        let mut offered: Vec<String> = eps
+            .iter()
+            .filter(|e| e.mode != 1)
+            .map(|e| format!("{} / {}", policy_short(&e.policy), mode_name(e.mode)))
+            .collect();
+        offered.dedup();
+        return Err(format!(
+            "the server has no {} / {} endpoint (it offers: {})",
+            policy.name(),
+            if mode == 0 {
+                "any mode"
+            } else {
+                mode_name(mode)
+            },
+            if offered.is_empty() {
+                "only None".to_string()
+            } else {
+                offered.join(", ")
             }
+        ));
+    }
+    matching.sort_by_key(|e| std::cmp::Reverse(e.mode));
+    for e in &matching {
+        if let Some(t) = e.tokens.iter().find(|t| t.token_type == token_type) {
             return Ok(((*e).clone(), t.clone()));
         }
     }
+    let e = matching[0];
     Err(format!(
-        "the None endpoint does not accept {} login",
-        token_type_name(token_type).to_lowercase()
+        "the {} / {} endpoint does not accept {} login (it offers: {})",
+        policy.name(),
+        mode_name(e.mode),
+        token_type_name(token_type).to_lowercase(),
+        e.tokens
+            .iter()
+            .map(|t| token_type_name(t.token_type))
+            .collect::<Vec<_>>()
+            .join(", ")
     ))
+}
+
+/// Plain-language advice for common OPC UA (security) errors.
+pub fn hint(e: &str) -> Option<&'static str> {
+    const REVOCATION: &str = "The server cannot check revocation for the client certificate (no CRL). For a self-signed client certificate, relax revocation checks or add a CRL on the server.";
+    const H: &[(&str, &str)] = &[
+        (
+            "BadSecurityChecksFailed",
+            "The server rejected the secure channel. Most often it does not trust this client's certificate yet: on the server, move the Network Analyser certificate from the rejected to the trusted list (certificate manager / PKI folder), then connect again. Also check that both clocks are right.",
+        ),
+        (
+            "BadCertificateUntrusted",
+            "The server does not trust this client's certificate. Trust it in the server's certificate manager (after the first attempt it is usually in the 'rejected' list).",
+        ),
+        (
+            "BadCertificateUriInvalid",
+            "The application URI in a certificate does not match the one announced (client) or the endpoint's (server).",
+        ),
+        (
+            "BadCertificateTimeInvalid",
+            "A certificate is expired or not yet valid — check the clocks on both machines.",
+        ),
+        (
+            "BadCertificateHostNameInvalid",
+            "The host name in the URL is not in the server certificate; connect with a name the certificate lists.",
+        ),
+        (
+            "BadCertificateUseNotAllowed",
+            "A certificate lacks the key usage OPC UA needs (digitalSignature, keyEncipherment, dataEncipherment).",
+        ),
+        ("BadCertificateIssuerRevocationUnknown", REVOCATION),
+        ("BadCertificateRevocationUnknown", REVOCATION),
+        ("BadCertificateRevoked", "The certificate has been revoked."),
+        (
+            "BadCertificateInvalid",
+            "The server could not parse or validate the certificate.",
+        ),
+        (
+            "BadIdentityTokenRejected",
+            "The server refused this kind of login on this endpoint (or does not trust the user certificate).",
+        ),
+        (
+            "BadIdentityTokenInvalid",
+            "The login token was malformed, or the password was encrypted with a policy the server did not expect.",
+        ),
+        (
+            "BadUserAccessDenied",
+            "Wrong user name or password, or this user may not log in.",
+        ),
+        (
+            "BadUserSignatureInvalid",
+            "The user certificate's signature was refused — does the key belong to the certificate?",
+        ),
+        (
+            "BadApplicationSignatureInvalid",
+            "A session signature did not verify — client and server disagree on the certificates or the policy.",
+        ),
+        (
+            "BadSecurityPolicyRejected",
+            "The server does not accept this security policy — pick another endpoint.",
+        ),
+        (
+            "BadSecurityModeRejected",
+            "The server does not accept this security mode — pick another endpoint.",
+        ),
+        (
+            "BadNonceInvalid",
+            "The server refused the nonce (often a policy or key-size mismatch).",
+        ),
+        (
+            "BadTooManySessions",
+            "The server has reached its session limit.",
+        ),
+        (
+            "the server closed the connection",
+            "Servers often just drop the connection when they reject a client certificate: check the server's rejected-certificates list and trust the client certificate.",
+        ),
+    ];
+    H.iter().find(|(k, _)| e.contains(k)).map(|(_, v)| *v)
+}
+
+pub fn with_hint(e: String) -> String {
+    match hint(&e) {
+        Some(h) => format!("{e} — {h}"),
+        None => e,
+    }
 }
 
 // ---------------------------------------------------------------- worker
 
 #[derive(Clone, Debug)]
-pub enum Auth {
-    DiscoverOnly,
+pub enum Login {
     Anonymous,
     User(String, String),
+    /// X.509 user certificate and key files.
+    Cert(PathBuf, PathBuf),
+}
+
+impl Login {
+    fn token_type(&self) -> u32 {
+        match self {
+            Login::Anonymous => 0,
+            Login::User(..) => 1,
+            Login::Cert(..) => 2,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionOpts {
+    pub policy: Policy,
+    /// 1 None, 2 Sign, 3 SignAndEncrypt (0 = best offered for the policy)
+    pub mode: u32,
+    pub login: Login,
+    /// Custom client application certificate and key (else the built-in one).
+    pub client_cert: Option<(PathBuf, PathBuf)>,
+    /// SHA-1 thumbprint (hex) of the server certificate the user accepted.
+    pub accepted_server: Option<String>,
+}
+
+impl SessionOpts {
+    pub fn anonymous_none() -> SessionOpts {
+        SessionOpts {
+            policy: Policy::None,
+            mode: 1,
+            login: Login::Anonymous,
+            client_cert: None,
+            accepted_server: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum Auth {
+    DiscoverOnly,
+    Session(SessionOpts),
 }
 
 pub enum Cmd {
@@ -1908,6 +2372,7 @@ pub struct SessionInfo {
     pub session_id: String,
     pub timeout_ms: f64,
     pub identity: String,
+    pub security: String,
     pub product: String,
     pub version: String,
     pub state: String,
@@ -1917,6 +2382,7 @@ pub struct SessionInfo {
 pub enum Event {
     Log(Level, String),
     Discovery(Box<Discovery>),
+    ClientCert(uac::CertSummary),
     Session(SessionInfo),
     Browsed(NodeId, Result<Vec<Reference>, String>),
     Attrs(NodeId, Result<Vec<(u32, DataValue)>, String>),
@@ -1947,7 +2413,7 @@ pub fn start(url: String, auth: Auth, timeout: Duration) -> (Handle, Receiver<Ev
     let (etx, erx) = channel();
     std::thread::spawn(move || {
         if let Err(e) = worker(url, auth, timeout, crx, &etx) {
-            let _ = etx.send(Event::Error(e));
+            let _ = etx.send(Event::Error(with_hint(e)));
         }
     });
     (Handle { tx }, erx)
@@ -1995,6 +2461,160 @@ fn server_info(c: &mut Client) -> (String, String, String, String) {
     (product, get(1), state, get(3))
 }
 
+/// The client application certificate: custom files or the built-in one
+/// (created on first use).
+fn client_identity(opts: &SessionOpts, log: &dyn Fn(Level, String)) -> Res<ClientIdentity> {
+    match &opts.client_cert {
+        Some((c, k)) => ClientIdentity::load(c, k),
+        None => {
+            let dir = uac::default_dir().ok_or("no data directory for the client certificate")?;
+            let (id, created) = ClientIdentity::load_or_create(&dir)?;
+            if created {
+                let s = id.summary();
+                log(
+                    Level::Warn,
+                    format!(
+                        "Created the client certificate {} (SHA-1 {}). Servers usually reject a new client the first time — trust it on the server, then connect again.",
+                        s.path.map(|p| p.display().to_string()).unwrap_or_default(),
+                        s.thumbprint
+                    ),
+                );
+            }
+            Ok(id)
+        }
+    }
+}
+
+/// An open, activated session.
+pub struct Opened {
+    pub client: Client,
+    pub session_id: NodeId,
+    pub timeout_ms: f64,
+    pub identity: String,
+}
+
+/// From a discovery channel `c` to an activated session as `opts` asks:
+/// picks the endpoint, opens a secured channel when needed (after checking
+/// the accepted server certificate), CreateSession, ActivateSession.
+pub fn open_session(
+    c: Client,
+    endpoints: &[Endpoint],
+    opts: &SessionOpts,
+    log: &dyn Fn(Level, String),
+    on_client_cert: &dyn Fn(uac::CertSummary),
+) -> Res<Opened> {
+    let (ep, tok) = pick_endpoint(endpoints, opts.policy, opts.mode, opts.login.token_type())?;
+    let url = c.url.clone();
+    let timeout = c.timeout;
+    let mut c = if ep.mode == 1 || opts.policy == Policy::None {
+        c
+    } else {
+        let thumb = uac::hex(&uac::thumbprint(&ep.cert));
+        match &opts.accepted_server {
+            Some(t) if *t == thumb => {}
+            Some(_) => {
+                return Err("the server certificate changed after you accepted it — Discover again and review it".into());
+            }
+            None => {
+                return Err("the server certificate has not been accepted — trust it first".into());
+            }
+        }
+        let id = client_identity(opts, log)?;
+        let s = id.summary();
+        on_client_cert(s.clone());
+        c.close();
+        log(
+            Level::Info,
+            format!(
+                "Opening a {} / {} channel as {} (client certificate SHA-1 {})…",
+                opts.policy.name(),
+                mode_name(ep.mode),
+                id.app_uri,
+                s.thumbprint
+            ),
+        );
+        let sc = Client::connect_with(
+            &url,
+            timeout,
+            Some(Security {
+                policy: opts.policy,
+                mode: ep.mode,
+                identity: id,
+                server_cert: ep.cert.clone(),
+            }),
+        )?;
+        log(
+            Level::Good,
+            format!("Secure channel open ({})", sc.security_text()),
+        );
+        sc
+    };
+    let channel_policy = Policy::from_uri(&ep.policy).unwrap_or(Policy::None);
+    let (identity, who) = match &opts.login {
+        Login::Anonymous => (
+            Identity::Anonymous(tok.policy_id.clone()),
+            "anonymous".into(),
+        ),
+        Login::User(u, p) => {
+            let eff = if tok.security_policy.is_empty() {
+                channel_policy
+            } else {
+                Policy::from_uri(&tok.security_policy).unwrap_or(channel_policy)
+            };
+            if eff == Policy::None && ep.mode == 3 {
+                log(
+                    Level::Info,
+                    "The password is protected by the channel encryption only (the user token policy is None)"
+                        .into(),
+                );
+            } else if eff == Policy::None {
+                log(
+                    Level::Warn,
+                    format!(
+                        "The password is sent unencrypted ({} channel, user token policy None)",
+                        mode_name(ep.mode)
+                    ),
+                );
+            } else {
+                log(
+                    Level::Info,
+                    format!("Password encrypted with {}", eff.name()),
+                );
+            }
+            (
+                Identity::User {
+                    policy: tok.policy_id.clone(),
+                    security_policy: tok.security_policy.clone(),
+                    user: u.clone(),
+                    password: p.clone(),
+                },
+                format!("user {u}"),
+            )
+        }
+        Login::Cert(cp, kp) => {
+            let user = ClientIdentity::load_user(cp, kp)?;
+            let who = format!("certificate {}", uac::summarize(&user.0, None).subject);
+            (
+                Identity::Cert {
+                    policy: tok.policy_id.clone(),
+                    security_policy: tok.security_policy.clone(),
+                    cert: user.0,
+                    key: Box::new(user.1),
+                },
+                who,
+            )
+        }
+    };
+    let (session_id, timeout_ms) = c.create_session()?;
+    c.activate_session(&identity)?;
+    Ok(Opened {
+        client: c,
+        session_id,
+        timeout_ms,
+        identity: who,
+    })
+}
+
 fn worker(
     url: String,
     auth: Auth,
@@ -2010,7 +2630,7 @@ fn worker(
     log(
         Level::Good,
         format!(
-            "HEL/ACK and secure channel (None) open with {} in {:.0} ms",
+            "HEL/ACK and discovery channel (None) open with {} in {:.0} ms",
             c.addr, c.connect_ms
         ),
     );
@@ -2025,50 +2645,34 @@ fn worker(
     );
     let endpoints = d.endpoints.clone();
     let _ = tx.send(Event::Discovery(Box::new(d)));
-    let identity = match &auth {
+    let opts = match auth {
         Auth::DiscoverOnly => {
             c.close();
             let _ = tx.send(Event::Closed("Discovery finished".into()));
             return Ok(());
         }
-        Auth::Anonymous => {
-            let (_, t) = pick_none_endpoint(&endpoints, 0)?;
-            Identity::Anonymous(t.policy_id)
-        }
-        Auth::User(u, p) => {
-            let (_, t) = pick_none_endpoint(&endpoints, 1)?;
-            log(
-                Level::Warn,
-                "Sending the password in clear text (SecurityPolicy None)".into(),
-            );
-            Identity::User {
-                policy: t.policy_id,
-                user: u.clone(),
-                password: p.clone(),
-            }
-        }
+        Auth::Session(o) => o,
     };
-    let (sid, sto) = c.create_session()?;
-    c.activate_session(&identity)?;
+    let opened = open_session(c, &endpoints, &opts, &log, &|s| {
+        let _ = tx.send(Event::ClientCert(s));
+    })?;
+    let mut c = opened.client;
+    let (sid, sto) = (opened.session_id, opened.timeout_ms);
     let (product, version, state, started) = server_info(&mut c);
     log(
         Level::Good,
         format!(
-            "Session {sid} active ({}), timeout {:.0} s",
-            match &identity {
-                Identity::Anonymous(_) => "anonymous".to_string(),
-                Identity::User { user, .. } => format!("user {user}"),
-            },
+            "Session {sid} active ({}, {}), timeout {:.0} s",
+            opened.identity,
+            c.security_text(),
             sto / 1000.0
         ),
     );
     let _ = tx.send(Event::Session(SessionInfo {
         session_id: sid.to_string(),
         timeout_ms: sto,
-        identity: match &identity {
-            Identity::Anonymous(_) => "Anonymous".into(),
-            Identity::User { user, .. } => user.clone(),
-        },
+        identity: opened.identity,
+        security: c.security_text(),
         product,
         version,
         state,
@@ -2138,26 +2742,90 @@ fn is_fatal(e: &str) -> bool {
         || e.contains("send:")
         || e.contains("BadSession")
         || e.contains("BadSecureChannel")
+        || e.contains("BadSecurityChecksFailed")
+        || e.contains("unknown security token")
 }
 
 // ---------------------------------------------------------------- CLI
 
-/// `--opcua URL [anon]`
+pub const CLI_USAGE: &str = "usage: --opcua opc.tcp://HOST[:4840][/PATH] [browse]
+         [--policy NAME --mode sign|encrypt] [--user U --password P]
+         [--user-cert FILE --user-key FILE] [--cert FILE --key FILE] [--trust]
+  NAME: None, Basic256Sha256, Aes128_Sha256_RsaOaep, Aes256_Sha256_RsaPss,
+        Basic256, Basic128Rsa15 (deprecated)
+  --cert/--key   client application certificate (default: built-in, created
+                 on first use in the data directory)
+  --trust        trust the server certificate (saved) — needed the first time";
+
+fn cli_fail(e: impl std::fmt::Display) -> ! {
+    eprintln!("{e}");
+    std::process::exit(1)
+}
+
+/// `--opcua URL [browse] [options]`
 pub fn cli(args: &[String]) {
-    let Some(url) = args.first() else {
-        eprintln!("usage: --opcua opc.tcp://HOST[:4840][/PATH] [browse]");
+    let mut url = None;
+    let mut browse = false;
+    let mut policy = None;
+    let mut mode = None;
+    let (mut user, mut password) = (None, None);
+    let (mut user_cert, mut user_key) = (None, None);
+    let (mut cert, mut key) = (None, None);
+    let mut trust = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        let mut val = || -> String {
+            i += 1;
+            args.get(i).cloned().unwrap_or_else(|| {
+                eprintln!("{a}: missing value\n{CLI_USAGE}");
+                std::process::exit(2)
+            })
+        };
+        match a {
+            "browse" => browse = true,
+            "--policy" => {
+                let v = val();
+                policy = Some(Policy::parse(&v).unwrap_or_else(|| {
+                    eprintln!("--policy: unknown policy '{v}'\n{CLI_USAGE}");
+                    std::process::exit(2)
+                }))
+            }
+            "--mode" => {
+                mode = Some(match val().to_ascii_lowercase().as_str() {
+                    "none" => 1,
+                    "sign" => 2,
+                    "encrypt" | "signandencrypt" | "sign-and-encrypt" => 3,
+                    m => {
+                        eprintln!("--mode: expected sign or encrypt, not '{m}'");
+                        std::process::exit(2)
+                    }
+                })
+            }
+            "--user" => user = Some(val()),
+            "--password" => password = Some(val()),
+            "--user-cert" => user_cert = Some(PathBuf::from(val())),
+            "--user-key" => user_key = Some(PathBuf::from(val())),
+            "--cert" => cert = Some(PathBuf::from(val())),
+            "--key" => key = Some(PathBuf::from(val())),
+            "--trust" => trust = true,
+            s if !s.starts_with("--") && url.is_none() => url = Some(s.to_string()),
+            s => {
+                eprintln!("--opcua: unexpected '{s}'\n{CLI_USAGE}");
+                std::process::exit(2)
+            }
+        }
+        i += 1;
+    }
+    let Some(url) = url else {
+        eprintln!("{CLI_USAGE}");
         std::process::exit(2)
     };
-    let url = normalize_url(url);
-    let browse = args.get(1).is_some_and(|a| a == "browse");
-    let mut c = Client::connect(&url, Duration::from_secs(10)).unwrap_or_else(|e| {
-        eprintln!("{e}");
-        std::process::exit(1)
-    });
-    let d = discover(&mut c).unwrap_or_else(|e| {
-        eprintln!("{e}");
-        std::process::exit(1)
-    });
+    let url = normalize_url(&url);
+    let session =
+        browse || policy.is_some() || mode.is_some() || user.is_some() || user_cert.is_some();
+    let mut c = Client::connect(&url, Duration::from_secs(10)).unwrap_or_else(|e| cli_fail(e));
+    let d = discover(&mut c).unwrap_or_else(|e| cli_fail(e));
     println!("{url} ({}) connect {:.0} ms", c.addr, c.connect_ms);
     println!("\nEndpoints:");
     for e in &d.endpoints {
@@ -2188,30 +2856,97 @@ pub fn cli(args: &[String]) {
         }
     }
     print!("{}", crate::widgets::findings_text(&d.findings));
-    if browse {
-        let r = pick_none_endpoint(&d.endpoints, 0).and_then(|(_, t)| {
-            c.create_session()?;
-            c.activate_session(&Identity::Anonymous(t.policy_id))?;
-            let (p, v, s, st) = server_info(&mut c);
-            println!("\nSession: {p} {v}, state {s}, started {st}");
-            c.browse(&NodeId::num(0, OBJECTS))
-        });
-        match r {
-            Ok(refs) => {
-                println!("Objects:");
-                for r in refs {
-                    println!(
-                        "  {:<12} {:<30} {}",
-                        node_class_name(r.class),
-                        r.display,
-                        r.node
+    if !session {
+        c.close();
+        return;
+    }
+    let policy = policy.unwrap_or(Policy::None);
+    let login = match (user, password, user_cert, user_key) {
+        (Some(u), p, _, _) => Login::User(u, p.unwrap_or_default()),
+        (None, _, Some(c), Some(k)) => Login::Cert(c, k),
+        (None, _, Some(_), None) | (None, _, None, Some(_)) => {
+            cli_fail("--user-cert and --user-key go together")
+        }
+        _ => Login::Anonymous,
+    };
+    let client_cert = match (cert, key) {
+        (Some(c), Some(k)) => Some((c, k)),
+        (None, None) => None,
+        _ => cli_fail("--cert and --key go together"),
+    };
+    let mut opts = SessionOpts {
+        policy,
+        mode: mode.unwrap_or(if policy == Policy::None { 1 } else { 3 }),
+        login,
+        client_cert,
+        accepted_server: None,
+    };
+    if policy != Policy::None {
+        let (ep, _) = pick_endpoint(
+            &d.endpoints,
+            opts.policy,
+            opts.mode,
+            opts.login.token_type(),
+        )
+        .unwrap_or_else(|e| cli_fail(e));
+        let key = uac::trust_key(&ep.server.uri, &url);
+        let s = uac::summarize(&ep.cert, None);
+        match uac::trust_status(&key, &ep.cert) {
+            uac::Trust::Trusted => {
+                println!("\nServer certificate trusted (SHA-1 {})", s.thumbprint)
+            }
+            st => {
+                if let uac::Trust::Changed(old) = &st {
+                    println!("\nWARNING: the server certificate CHANGED (trusted before: {old})");
+                }
+                println!(
+                    "\nServer certificate: {}\n  valid until {} · SHA-1 {}",
+                    s.subject, s.not_after, s.thumbprint
+                );
+                if !trust {
+                    cli_fail(
+                        "Not trusted yet — check the thumbprint with the server administrator, then re-run with --trust",
                     );
                 }
+                uac::trust(&key, &ep.cert).unwrap_or_else(|e| cli_fail(e));
+                println!("Trusted and saved.");
             }
-            Err(e) => eprintln!("session: {e}"),
         }
+        opts.accepted_server = Some(uac::hex(&uac::thumbprint(&ep.cert)));
     }
-    c.close();
+    let log = |_: Level, s: String| println!("{s}");
+    let r = open_session(c, &d.endpoints, &opts, &log, &|s| {
+        println!(
+            "Client certificate: {} (SHA-1 {}){}",
+            s.app_uri,
+            s.thumbprint,
+            s.path
+                .map(|p| format!(" — {}", p.display()))
+                .unwrap_or_default()
+        )
+    });
+    let mut o = r.unwrap_or_else(|e| cli_fail(format!("session: {}", with_hint(e))));
+    let (p, v, s, st) = server_info(&mut o.client);
+    println!(
+        "\nSession ({}, {}): {p} {v}, state {s}, started {st}",
+        o.identity,
+        o.client.security_text()
+    );
+    match o.client.browse(&NodeId::num(0, OBJECTS)) {
+        Ok(refs) => {
+            println!("Objects:");
+            for r in refs {
+                println!(
+                    "  {:<12} {:<30} {}",
+                    node_class_name(r.class),
+                    r.display,
+                    r.node
+                );
+            }
+        }
+        Err(e) => eprintln!("browse: {e}"),
+    }
+    o.client.close();
 }
 
 // ---------------------------------------------------------------- tests
@@ -2353,8 +3088,19 @@ pub(crate) mod tests {
         assert!(has("Deprecated policies", Level::Warn));
         assert!(has("Encryption", Level::Good));
         assert!(has("Endpoint host", Level::Warn));
-        assert!(pick_none_endpoint(&eps, 0).is_ok());
-        assert!(pick_none_endpoint(&[ep(3, "Basic256Sha256", &[(0, "")])], 0).is_err());
+        assert!(pick_endpoint(&eps, Policy::None, 1, 0).is_ok());
+        assert!(pick_endpoint(&[ep(3, "Basic256Sha256", &[(0, "")])], Policy::None, 1, 0).is_err());
+        assert!(pick_endpoint(&eps, Policy::Basic256, 3, 1).is_ok());
+        assert!(
+            pick_endpoint(&eps, Policy::Basic256, 3, 0)
+                .unwrap_err()
+                .contains("does not accept anonymous")
+        );
+        assert!(
+            pick_endpoint(&eps, Policy::Basic256Sha256, 0, 1)
+                .unwrap_err()
+                .contains("offers: Basic256 / SignAndEncrypt")
+        );
         let enc = vec![ep(
             1,
             "None",
@@ -2363,11 +3109,8 @@ pub(crate) mod tests {
                 "http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256",
             )],
         )];
-        assert!(
-            pick_none_endpoint(&enc, 1)
-                .unwrap_err()
-                .contains("encrypted")
-        );
+        let (_, t) = pick_endpoint(&enc, Policy::None, 1, 1).unwrap();
+        assert!(t.security_policy.ends_with("Basic256Sha256"));
     }
 
     // ------------------------------------------------ in-process test server
@@ -2390,210 +3133,437 @@ pub(crate) mod tests {
             .null_ext();
     }
 
-    fn endpoints_body(w: &mut W) {
-        w.i32(1);
-        w.string(Some("opc.tcp://127.0.0.1:4840"));
-        w.string(Some("urn:test:server"))
-            .string(Some("urn:test"))
-            .localized("Test Server")
-            .u32(0)
-            .string(None)
-            .string(None)
-            .empty_array();
-        w.bytes(None).u32(1).string(Some(POLICY_NONE));
-        w.i32(2);
-        w.string(Some("anon"))
-            .u32(0)
-            .string(None)
-            .string(None)
-            .string(None);
-        w.string(Some("user"))
-            .u32(1)
-            .string(None)
-            .string(None)
-            .string(None);
-        w.string(Some(
-            "http://opcfoundation.org/UA-Profile/Transport/uatcp-uasc-uabinary",
-        ))
-        .u8(0);
+    /// (policy, mode, [(token type, token security policy URI)])
+    type TestEp = (Policy, u32, Vec<(u32, String)>);
+
+    #[derive(Clone)]
+    pub(crate) struct SrvCfg {
+        endpoints: Vec<TestEp>,
+        /// Answer secured OPNs with ERR BadSecurityChecksFailed.
+        reject_secure: bool,
     }
 
-    fn reply(s: &mut TcpStream, kind: &[u8; 3], req: u32, body: &[u8], split: bool) {
-        let mut sec = W::default();
-        if kind == b"OPN" {
-            sec.u32(7).string(Some(POLICY_NONE)).bytes(None).bytes(None);
-        } else {
-            sec.u32(7).u32(1);
-        }
-        let parts: Vec<&[u8]> = if split {
-            let mid = body.len() / 2;
-            vec![&body[..mid], &body[mid..]]
-        } else {
-            vec![body]
-        };
-        let last = parts.len() - 1;
-        for (i, p) in parts.into_iter().enumerate() {
-            let mut m = sec.0.clone();
-            m.extend_from_slice(&(i as u32 + 1).to_le_bytes());
-            m.extend_from_slice(&req.to_le_bytes());
-            m.extend_from_slice(p);
-            s.write_all(&frame(kind, if i == last { b'F' } else { b'C' }, &m))
-                .unwrap();
+    fn none_cfg() -> SrvCfg {
+        SrvCfg {
+            endpoints: vec![(
+                Policy::None,
+                1,
+                vec![(0, String::new()), (1, String::new())],
+            )],
+            reject_secure: false,
         }
     }
 
-    /// A tiny server: endpoints (sent in two chunks), session, browse with a
-    /// continuation point, read, and a ServiceFault for unknown nodes.
-    pub(crate) fn test_server() -> u16 {
+    fn endpoints_body(w: &mut W, eps: &[TestEp], cert: &[u8]) {
+        w.i32(eps.len() as i32);
+        for (p, mode, toks) in eps {
+            w.string(Some("opc.tcp://127.0.0.1:4840"));
+            w.string(Some("urn:test:server"))
+                .string(Some("urn:test"))
+                .localized("Test Server")
+                .u32(0)
+                .string(None)
+                .string(None)
+                .empty_array();
+            w.bytes((!cert.is_empty()).then_some(cert))
+                .u32(*mode)
+                .string(Some(&p.uri()));
+            w.i32(toks.len() as i32);
+            for (t, sp) in toks {
+                w.string(Some(&format!("tok{t}")))
+                    .u32(*t)
+                    .string(None)
+                    .string(None)
+                    .string((!sp.is_empty()).then_some(sp.as_str()));
+            }
+            w.string(Some(
+                "http://opcfoundation.org/UA-Profile/Transport/uatcp-uasc-uabinary",
+            ))
+            .u8(*mode as u8 * 10);
+        }
+    }
+
+    struct Srv {
+        policy: Policy,
+        encrypt: bool,
+        client_cert: Vec<u8>,
+        /// token id → (client→server keys, server→client keys)
+        keys: Vec<(u32, Keys, Keys)>,
+        session_nonce: Vec<u8>,
+        seq: u32,
+    }
+
+    impl Srv {
+        fn reply(
+            &mut self,
+            s: &mut TcpStream,
+            kind: &[u8; 3],
+            token: u32,
+            req: u32,
+            body: &[u8],
+            split: bool,
+        ) {
+            let id = &uac::tests::ids().1;
+            let parts: Vec<&[u8]> = if split {
+                let mid = body.len() / 2;
+                vec![&body[..mid], &body[mid..]]
+            } else {
+                vec![body]
+            };
+            let last = parts.len() - 1;
+            for (i, p) in parts.into_iter().enumerate() {
+                self.seq += 1;
+                let mut payload = self.seq.to_le_bytes().to_vec();
+                payload.extend_from_slice(&req.to_le_bytes());
+                payload.extend_from_slice(p);
+                let c = if i == last { b'F' } else { b'C' };
+                let f = if kind == b"OPN" {
+                    if self.policy == Policy::None {
+                        uac::seal_asym(Policy::None, c, 7, None, &[], None, &payload).unwrap()
+                    } else {
+                        let ck = uac::cert_public_key(&self.client_cert).unwrap();
+                        uac::seal_asym(
+                            self.policy,
+                            c,
+                            7,
+                            Some(&Local {
+                                cert: &id.cert,
+                                key: &id.key,
+                            }),
+                            &self.client_cert,
+                            Some(&ck),
+                            &payload,
+                        )
+                        .unwrap()
+                    }
+                } else {
+                    let k = self.keys.iter().find(|k| k.0 == token).map(|k| &k.2);
+                    uac::seal_sym(self.policy, self.encrypt, kind, c, 7, token, k, &payload)
+                        .unwrap()
+                };
+                s.write_all(&f).unwrap();
+            }
+        }
+    }
+
+    /// A tiny server: endpoints (sent in two chunks), secured channels with
+    /// the crypto module, session (with signatures and user checks: user
+    /// "op" / password "secret"), browse with a continuation point, read,
+    /// and a ServiceFault for unknown requests.
+    pub(crate) fn test_server_cfg(cfg: SrvCfg) -> u16 {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
         std::thread::spawn(move || {
-            let (mut s, _) = l.accept().unwrap();
-            let (k, _, _) = read_frame(&mut s).unwrap();
-            assert_eq!(&k, b"HEL");
-            let mut ack = W::default();
-            ack.u32(0).u32(65536).u32(65536).u32(0).u32(0);
-            s.write_all(&frame(b"ACK", b'F', &ack.0)).unwrap();
-            while let Some((kind, _, b)) = read_frame(&mut s) {
-                let mut r = R::new(&b);
-                r.u32().unwrap();
-                if &kind == b"OPN" {
-                    r.string().unwrap();
-                    r.bytes().unwrap();
-                    r.bytes().unwrap();
-                } else {
-                    r.u32().unwrap();
-                }
-                r.u32().unwrap();
-                let req = r.u32().unwrap();
-                if &kind == b"CLO" {
-                    return;
-                }
-                let t = r.node_id().unwrap();
-                // Skip the request header.
-                r.node_id().unwrap();
-                r.i64().unwrap();
-                r.u32().unwrap();
-                r.u32().unwrap();
-                r.string().unwrap();
-                r.u32().unwrap();
-                r.extension_object().unwrap();
-                let Ident::Num(t) = t.id else { panic!() };
-                let mut w = W::default();
-                let mut split = false;
-                match t {
-                    id::OPN_REQ => {
-                        w.type_id(id::OPN_RESP);
-                        resp_header(&mut w, 0);
-                        w.u32(0)
-                            .u32(7)
-                            .u32(1)
-                            .i64(now_ticks())
-                            .u32(600_000)
-                            .bytes(None);
-                    }
-                    id::GET_ENDPOINTS_REQ => {
-                        w.type_id(id::GET_ENDPOINTS_RESP);
-                        resp_header(&mut w, 0);
-                        endpoints_body(&mut w);
-                        split = true;
-                    }
-                    id::FIND_SERVERS_REQ => {
-                        w.type_id(id::FIND_SERVERS_RESP);
-                        resp_header(&mut w, 0);
-                        w.i32(0);
-                    }
-                    id::CREATE_SESSION_REQ => {
-                        w.type_id(id::CREATE_SESSION_RESP);
-                        resp_header(&mut w, 0);
-                        w.node_id(&NodeId::num(1, 1001))
-                            .node_id(&NodeId {
-                                ns: 0,
-                                id: Ident::Bytes(vec![9; 8]),
-                            })
-                            .f64(60_000.0)
-                            .bytes(Some(&[1; 32]))
-                            .bytes(None);
-                        endpoints_body(&mut w);
-                        w.i32(0).string(None).bytes(None).u32(0);
-                    }
-                    id::ACTIVATE_SESSION_REQ => {
-                        w.type_id(id::ACTIVATE_SESSION_RESP);
-                        resp_header(&mut w, 0);
-                        w.bytes(Some(&[2; 32])).i32(0).i32(0);
-                    }
-                    id::BROWSE_REQ | id::BROWSE_NEXT_REQ => {
-                        let first = t == id::BROWSE_REQ;
-                        w.type_id(if first {
-                            id::BROWSE_RESP
-                        } else {
-                            id::BROWSE_NEXT_RESP
-                        });
-                        resp_header(&mut w, 0);
-                        w.i32(1).u32(0);
-                        if first {
-                            w.bytes(Some(b"cp"));
-                        } else {
-                            w.bytes(None);
-                        }
-                        let name = if first { "Server" } else { "Demo" };
-                        let node = if first {
-                            NodeId::num(0, 2253)
-                        } else {
-                            NodeId {
-                                ns: 2,
-                                id: Ident::Str("Demo".into()),
-                            }
-                        };
-                        w.i32(1)
-                            .type_id(35)
-                            .bool(true)
-                            .node_id(&node)
-                            .u16(node.ns)
-                            .string(Some(name))
-                            .localized(name)
-                            .u32(1)
-                            .type_id(61);
-                        w.i32(0);
-                    }
-                    id::READ_REQ => {
-                        r.f64().unwrap();
-                        r.u32().unwrap();
-                        let n = r.i32().unwrap();
-                        w.type_id(id::READ_RESP);
-                        resp_header(&mut w, 0);
-                        w.i32(n);
-                        for _ in 0..n {
-                            let node = r.node_id().unwrap();
-                            let attr = r.u32().unwrap();
-                            r.string().unwrap();
-                            r.qualified_name().unwrap();
-                            if node == NodeId::num(0, 9999) {
-                                w.u8(0x02).u32(0x8034_0000);
-                            } else if attr == 13 {
-                                w.u8(0x0d).u8(6).i32(42).u32(0).i64(now_ticks());
-                            } else if attr == 4 {
-                                w.u8(0x01).u8(21).localized("Name");
-                            } else {
-                                w.u8(0x02).u32(0x8035_0000);
-                            }
-                        }
-                        w.i32(0);
-                    }
-                    id::CLOSE_SESSION_REQ => {
-                        w.type_id(id::CLOSE_SESSION_RESP);
-                        resp_header(&mut w, 0);
-                    }
-                    _ => {
-                        w.type_id(id::SERVICE_FAULT);
-                        resp_header(&mut w, 0x800B_0000);
-                    }
-                }
-                let kind: &[u8; 3] = if &kind == b"OPN" { b"OPN" } else { b"MSG" };
-                reply(&mut s, kind, req, &w.0, split);
+            for conn in l.incoming() {
+                let Ok(mut s) = conn else { return };
+                let cfg = cfg.clone();
+                std::thread::spawn(move || serve(&mut s, &cfg));
             }
         });
         port
+    }
+
+    pub(crate) fn test_server() -> u16 {
+        test_server_cfg(none_cfg())
+    }
+
+    fn serve(s: &mut TcpStream, cfg: &SrvCfg) {
+        let id = &uac::tests::ids().1;
+        let server_cert = if cfg.endpoints.iter().any(|e| e.0 != Policy::None) {
+            id.cert.clone()
+        } else {
+            Vec::new()
+        };
+        let Some((k, _, _)) = read_frame(s) else {
+            return;
+        };
+        assert_eq!(&k, b"HEL");
+        let mut ack = W::default();
+        ack.u32(0).u32(65536).u32(65536).u32(0).u32(0);
+        s.write_all(&frame(b"ACK", b'F', &ack.0)).unwrap();
+        let mut st = Srv {
+            policy: Policy::None,
+            encrypt: false,
+            client_cert: Vec::new(),
+            keys: Vec::new(),
+            session_nonce: Vec::new(),
+            seq: 0,
+        };
+        let mut next_token = 1;
+        while let Some((kind, chunk, b)) = read_frame(s) {
+            let mut fr = kind.to_vec();
+            fr.push(chunk);
+            fr.extend_from_slice(&((b.len() + 8) as u32).to_le_bytes());
+            fr.extend_from_slice(&b);
+            let mut token = 0;
+            let payload = if &kind == b"OPN" {
+                let (h, _) = uac::asym_header(&fr).unwrap();
+                let p = Policy::from_uri(&h.policy_uri).unwrap();
+                if p != Policy::None && cfg.reject_secure {
+                    let mut e = W::default();
+                    e.u32(0x8013_0000).string(Some("certificate not trusted"));
+                    s.write_all(&frame(b"ERR", b'F', &e.0)).unwrap();
+                    return;
+                }
+                let (h, p2) = uac::open_asym(
+                    &fr,
+                    Some(&Local {
+                        cert: &id.cert,
+                        key: &id.key,
+                    }),
+                )
+                .unwrap();
+                st.policy = p;
+                st.client_cert = h.sender_cert;
+                p2
+            } else {
+                token = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+                let k = st.keys.iter().find(|k| k.0 == token).map(|k| &k.1);
+                assert!(
+                    st.policy == Policy::None || k.is_some(),
+                    "unknown token {token}"
+                );
+                uac::open_sym(st.policy, st.encrypt, &fr, k).expect("client chunk verifies")
+            };
+            let mut r = R::new(&payload);
+            r.u32().unwrap();
+            let req = r.u32().unwrap();
+            if &kind == b"CLO" {
+                return;
+            }
+            let t = r.node_id().unwrap();
+            // Skip the request header.
+            r.node_id().unwrap();
+            r.i64().unwrap();
+            r.u32().unwrap();
+            r.u32().unwrap();
+            r.string().unwrap();
+            r.u32().unwrap();
+            r.extension_object().unwrap();
+            let Ident::Num(t) = t.id else { panic!() };
+            let mut w = W::default();
+            let mut split = false;
+            let mut reply_kind: &[u8; 3] = b"MSG";
+            match t {
+                id::OPN_REQ => {
+                    r.u32().unwrap();
+                    r.u32().unwrap();
+                    let mode = r.u32().unwrap();
+                    let client_nonce = r.bytes().unwrap().unwrap_or_default();
+                    st.encrypt = mode == 3;
+                    let server_nonce = uac::random(st.policy.nonce_len());
+                    token = next_token;
+                    next_token += 1;
+                    if st.policy != Policy::None {
+                        assert_eq!(client_nonce.len(), st.policy.nonce_len());
+                        st.keys.push((
+                            token,
+                            uac::derive(st.policy, &server_nonce, &client_nonce),
+                            uac::derive(st.policy, &client_nonce, &server_nonce),
+                        ));
+                    }
+                    w.type_id(id::OPN_RESP);
+                    resp_header(&mut w, 0);
+                    w.u32(0)
+                        .u32(7)
+                        .u32(token)
+                        .i64(now_ticks())
+                        .u32(600_000)
+                        .bytes((!server_nonce.is_empty()).then_some(&server_nonce[..]));
+                    reply_kind = b"OPN";
+                }
+                id::GET_ENDPOINTS_REQ => {
+                    w.type_id(id::GET_ENDPOINTS_RESP);
+                    resp_header(&mut w, 0);
+                    endpoints_body(&mut w, &cfg.endpoints, &server_cert);
+                    split = true;
+                }
+                id::FIND_SERVERS_REQ => {
+                    w.type_id(id::FIND_SERVERS_RESP);
+                    resp_header(&mut w, 0);
+                    w.i32(0);
+                }
+                id::CREATE_SESSION_REQ => {
+                    let app_uri = r.str().unwrap();
+                    r.string().unwrap();
+                    r.localized().unwrap();
+                    r.u32().unwrap();
+                    r.string().unwrap();
+                    r.string().unwrap();
+                    r.array(|r| r.str()).unwrap();
+                    r.string().unwrap();
+                    r.string().unwrap();
+                    r.string().unwrap();
+                    let client_nonce = r.bytes().unwrap().unwrap_or_default();
+                    let client_cert = r.bytes().unwrap().unwrap_or_default();
+                    if st.policy != Policy::None {
+                        assert_eq!(client_cert, st.client_cert);
+                        assert_eq!(uac::cert_uris(&client_cert), vec![app_uri]);
+                    }
+                    st.session_nonce = uac::random(32);
+                    w.type_id(id::CREATE_SESSION_RESP);
+                    resp_header(&mut w, 0);
+                    w.node_id(&NodeId::num(1, 1001))
+                        .node_id(&NodeId {
+                            ns: 0,
+                            id: Ident::Bytes(vec![9; 8]),
+                        })
+                        .f64(60_000.0)
+                        .bytes(Some(&st.session_nonce))
+                        .bytes((!server_cert.is_empty()).then_some(&server_cert[..]));
+                    endpoints_body(&mut w, &cfg.endpoints, &server_cert);
+                    w.i32(0);
+                    if st.policy != Policy::None {
+                        let mut d = client_cert.clone();
+                        d.extend_from_slice(&client_nonce);
+                        w.string(Some(st.policy.sig_algorithm_uri()))
+                            .bytes(Some(&uac::rsa_sign(st.policy, &id.key, &d).unwrap()));
+                    } else {
+                        w.string(None).bytes(None);
+                    }
+                    w.u32(0);
+                }
+                id::ACTIVATE_SESSION_REQ => {
+                    let _alg = r.string().unwrap();
+                    let sig = r.bytes().unwrap().unwrap_or_default();
+                    r.array(|r| {
+                        r.bytes()?;
+                        r.bytes()
+                    })
+                    .unwrap();
+                    r.array(|r| r.str()).unwrap();
+                    let (tt, tb) = r.extension_object().unwrap();
+                    r.string().unwrap();
+                    let tsig = r.bytes().unwrap().unwrap_or_default();
+                    let mut signed = server_cert.clone();
+                    signed.extend_from_slice(&st.session_nonce);
+                    let mut status = 0;
+                    if st.policy != Policy::None {
+                        let ck = uac::cert_public_key(&st.client_cert).unwrap();
+                        if uac::rsa_verify(st.policy, &ck, &signed, &sig).is_err() {
+                            status = 0x8058_0000;
+                        }
+                    }
+                    let tb = tb.unwrap_or_default();
+                    let mut tr = R::new(&tb);
+                    let pid = tr.str().unwrap();
+                    let ttype: u32 = pid[3..].parse().unwrap();
+                    let token_sp = cfg
+                        .endpoints
+                        .iter()
+                        .find(|e| e.0 == st.policy)
+                        .and_then(|e| e.2.iter().find(|x| x.0 == ttype))
+                        .map(|x| x.1.clone())
+                        .unwrap_or_default();
+                    let eff = Policy::from_uri(&token_sp).unwrap_or(st.policy);
+                    match tt {
+                        NodeId {
+                            id: Ident::Num(id::USERNAME_TOKEN),
+                            ..
+                        } => {
+                            let user = tr.str().unwrap();
+                            let pw = tr.bytes().unwrap().unwrap_or_default();
+                            let alg = tr.str().unwrap();
+                            let pw = if alg.is_empty() {
+                                assert_eq!(eff, Policy::None);
+                                pw
+                            } else {
+                                assert_eq!(alg, eff.enc_algorithm_uri());
+                                let p = uac::rsa_decrypt(eff, &id.key, &pw).unwrap();
+                                let n = u32::from_le_bytes(p[..4].try_into().unwrap()) as usize;
+                                assert_eq!(&p[4 + n - 32..4 + n], &st.session_nonce[..]);
+                                p[4..4 + n - 32].to_vec()
+                            };
+                            if user != "op" || pw != b"secret" {
+                                status = 0x801F_0000;
+                            }
+                        }
+                        NodeId {
+                            id: Ident::Num(id::X509_TOKEN),
+                            ..
+                        } => {
+                            let uc = tr.bytes().unwrap().unwrap_or_default();
+                            let uk = uac::cert_public_key(&uc).unwrap();
+                            if uac::rsa_verify(eff, &uk, &signed, &tsig).is_err() {
+                                status = 0x8057_0000;
+                            }
+                        }
+                        _ => {}
+                    }
+                    w.type_id(id::ACTIVATE_SESSION_RESP);
+                    resp_header(&mut w, status);
+                    st.session_nonce = uac::random(32);
+                    w.bytes(Some(&st.session_nonce)).i32(0).i32(0);
+                }
+                id::BROWSE_REQ | id::BROWSE_NEXT_REQ => {
+                    let first = t == id::BROWSE_REQ;
+                    w.type_id(if first {
+                        id::BROWSE_RESP
+                    } else {
+                        id::BROWSE_NEXT_RESP
+                    });
+                    resp_header(&mut w, 0);
+                    w.i32(1).u32(0);
+                    if first {
+                        w.bytes(Some(b"cp"));
+                    } else {
+                        w.bytes(None);
+                    }
+                    let name = if first { "Server" } else { "Demo" };
+                    let node = if first {
+                        NodeId::num(0, 2253)
+                    } else {
+                        NodeId {
+                            ns: 2,
+                            id: Ident::Str("Demo".into()),
+                        }
+                    };
+                    w.i32(1)
+                        .type_id(35)
+                        .bool(true)
+                        .node_id(&node)
+                        .u16(node.ns)
+                        .string(Some(name))
+                        .localized(name)
+                        .u32(1)
+                        .type_id(61);
+                    w.i32(0);
+                }
+                id::READ_REQ => {
+                    r.f64().unwrap();
+                    r.u32().unwrap();
+                    let n = r.i32().unwrap();
+                    w.type_id(id::READ_RESP);
+                    resp_header(&mut w, 0);
+                    w.i32(n);
+                    for _ in 0..n {
+                        let node = r.node_id().unwrap();
+                        let attr = r.u32().unwrap();
+                        r.string().unwrap();
+                        r.qualified_name().unwrap();
+                        if node == NodeId::num(0, 9999) {
+                            w.u8(0x02).u32(0x8034_0000);
+                        } else if attr == 13 {
+                            w.u8(0x0d).u8(6).i32(42).u32(0).i64(now_ticks());
+                        } else if attr == 4 {
+                            w.u8(0x01).u8(21).localized("Name");
+                        } else {
+                            w.u8(0x02).u32(0x8035_0000);
+                        }
+                    }
+                    w.i32(0);
+                }
+                id::CLOSE_SESSION_REQ => {
+                    w.type_id(id::CLOSE_SESSION_RESP);
+                    resp_header(&mut w, 0);
+                }
+                _ => {
+                    w.type_id(id::SERVICE_FAULT);
+                    resp_header(&mut w, 0x800B_0000);
+                }
+            }
+            st.reply(s, reply_kind, token, req, &w.0, split);
+        }
     }
 
     #[test]
@@ -2610,7 +3580,7 @@ pub(crate) mod tests {
                 .iter()
                 .any(|f| f.key == "Unsecured endpoint" && f.level == Level::Bad)
         );
-        let (_, t) = pick_none_endpoint(&d.endpoints, 0).unwrap();
+        let (_, t) = pick_endpoint(&d.endpoints, Policy::None, 1, 0).unwrap();
         let (sid, timeout) = c.create_session().unwrap();
         assert_eq!(sid, NodeId::num(1, 1001));
         assert_eq!(timeout, 60_000.0);
@@ -2638,12 +3608,207 @@ pub(crate) mod tests {
         c.close();
     }
 
+    fn secure_cfg() -> SrvCfg {
+        let b256 = Policy::Basic256Sha256.uri();
+        SrvCfg {
+            endpoints: vec![
+                (Policy::None, 1, vec![(0, String::new()), (1, b256.clone())]),
+                (
+                    Policy::Basic256Sha256,
+                    3,
+                    vec![(0, String::new()), (1, String::new())],
+                ),
+                (Policy::Aes256Sha256RsaPss, 2, vec![(1, b256.clone())]),
+                (
+                    Policy::Aes128Sha256RsaOaep,
+                    3,
+                    vec![(1, String::new()), (2, String::new())],
+                ),
+                (Policy::Basic256, 3, vec![(1, String::new())]),
+                (Policy::Basic128Rsa15, 2, vec![(1, String::new())]),
+            ],
+            reject_secure: false,
+        }
+    }
+
+    fn security(policy: Policy, mode: u32) -> Security {
+        let (c, s) = uac::tests::ids();
+        Security {
+            policy,
+            mode,
+            identity: c.clone(),
+            server_cert: s.cert.clone(),
+        }
+    }
+
+    fn user(policy: &str, sp: &str, pw: &str) -> Identity {
+        Identity::User {
+            policy: policy.into(),
+            security_policy: sp.into(),
+            user: "op".into(),
+            password: pw.into(),
+        }
+    }
+
+    #[test]
+    fn secured_sessions_end_to_end() {
+        let port = test_server_cfg(secure_cfg());
+        let url = format!("opc.tcp://127.0.0.1:{port}");
+        let cases = [
+            (Policy::Basic256Sha256, 3, ""),
+            (
+                Policy::Aes256Sha256RsaPss,
+                2,
+                "http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256",
+            ),
+            (Policy::Aes128Sha256RsaOaep, 3, ""),
+            (Policy::Basic256, 3, ""),
+            (Policy::Basic128Rsa15, 2, ""),
+        ];
+        for (p, mode, sp) in cases {
+            let mut c = Client::connect_with(&url, Duration::from_secs(5), Some(security(p, mode)))
+                .unwrap_or_else(|e| panic!("{p:?}: {e}"));
+            assert_eq!(
+                c.security_text(),
+                format!("{} / {}", p.name(), mode_name(mode))
+            );
+            // Endpoints over the secured channel (two chunks).
+            assert_eq!(c.get_endpoints().unwrap().len(), 6);
+            c.create_session().unwrap();
+            c.activate_session(&user("tok1", sp, "secret"))
+                .unwrap_or_else(|e| panic!("{p:?}: {e}"));
+            assert_eq!(c.browse(&NodeId::num(0, OBJECTS)).unwrap().len(), 2);
+            // Token renewal: new keys, reads keep working.
+            c.open_channel(true).unwrap();
+            assert_eq!(c.keys.len(), 2);
+            let v = c.read(&[(NodeId::num(2, 5), 13)]).unwrap();
+            assert_eq!(v[0].value, Value::Int(42, 6));
+            c.close();
+            // A wrong password is refused (and decrypted correctly server-side).
+            let mut c = Client::connect_with(&url, Duration::from_secs(5), Some(security(p, mode)))
+                .unwrap();
+            c.create_session().unwrap();
+            let e = c.activate_session(&user("tok1", sp, "wrong")).unwrap_err();
+            assert!(e.contains("BadUserAccessDenied"), "{e}");
+            assert!(hint(&e).is_some());
+        }
+        // Anonymous on Basic256Sha256; X.509 user token on Aes128.
+        let mut c = Client::connect_with(
+            &url,
+            Duration::from_secs(5),
+            Some(security(Policy::Basic256Sha256, 3)),
+        )
+        .unwrap();
+        c.create_session().unwrap();
+        c.activate_session(&Identity::Anonymous("tok0".into()))
+            .unwrap();
+        c.close();
+        let (uc, _) = uac::tests::ids();
+        let mut c = Client::connect_with(
+            &url,
+            Duration::from_secs(5),
+            Some(security(Policy::Aes128Sha256RsaOaep, 3)),
+        )
+        .unwrap();
+        c.create_session().unwrap();
+        c.activate_session(&Identity::Cert {
+            policy: "tok2".into(),
+            security_policy: String::new(),
+            cert: uc.cert.clone(),
+            key: Box::new(uc.key.clone()),
+        })
+        .unwrap();
+        c.close();
+        // Password encrypted with Basic256Sha256 over an unsecured channel.
+        let mut c = Client::connect(&url, Duration::from_secs(5)).unwrap();
+        c.create_session().unwrap();
+        c.activate_session(&user("tok1", &Policy::Basic256Sha256.uri(), "secret"))
+            .unwrap();
+        c.close();
+    }
+
+    #[test]
+    fn open_session_checks_trust_and_rejections() {
+        let port = test_server_cfg(secure_cfg());
+        let url = format!("opc.tcp://127.0.0.1:{port}");
+        let (cid, sid) = uac::tests::ids();
+        let dir = std::env::temp_dir().join(format!("na-opcua-sess-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cp, kp) = (dir.join("c.der"), dir.join("k.pem"));
+        std::fs::write(&cp, &cid.cert).unwrap();
+        std::fs::write(
+            &kp,
+            uac::pem_encode(
+                "PRIVATE KEY",
+                rsa::pkcs8::EncodePrivateKey::to_pkcs8_der(&cid.key)
+                    .unwrap()
+                    .as_bytes(),
+            ),
+        )
+        .unwrap();
+        let mut opts = SessionOpts {
+            policy: Policy::Basic256Sha256,
+            mode: 3,
+            login: Login::User("op".into(), "secret".into()),
+            client_cert: Some((cp.clone(), kp.clone())),
+            accepted_server: None,
+        };
+        let log = |_: Level, _: String| {};
+        let discover_at = |url: &str| {
+            let mut c = Client::connect(url, Duration::from_secs(5)).unwrap();
+            let d = discover(&mut c).unwrap();
+            (c, d.endpoints)
+        };
+        // Not accepted → refused before any secured traffic.
+        let (c, eps) = discover_at(&url);
+        let e = open_session(c, &eps, &opts, &log, &|_| {}).err().unwrap();
+        assert!(e.contains("not been accepted"), "{e}");
+        // Wrong thumbprint → refused.
+        opts.accepted_server = Some("00".repeat(20));
+        let (c, eps) = discover_at(&url);
+        let e = open_session(c, &eps, &opts, &log, &|_| {}).err().unwrap();
+        assert!(e.contains("changed"), "{e}");
+        // Accepted → session.
+        opts.accepted_server = Some(uac::hex(&uac::thumbprint(&sid.cert)));
+        let (c, eps) = discover_at(&url);
+        let seen = std::cell::Cell::new(false);
+        let mut o = open_session(c, &eps, &opts, &log, &|s| {
+            assert_eq!(s.app_uri, "urn:test:client");
+            seen.set(true)
+        })
+        .unwrap();
+        assert!(seen.get());
+        assert_eq!(o.identity, "user op");
+        assert_eq!(o.client.browse(&NodeId::num(0, OBJECTS)).unwrap().len(), 2);
+        o.client.close();
+        // A login type the endpoint does not offer.
+        opts.login = Login::Anonymous;
+        opts.policy = Policy::Aes256Sha256RsaPss;
+        opts.mode = 0;
+        let (c, eps) = discover_at(&url);
+        let e = open_session(c, &eps, &opts, &log, &|_| {}).err().unwrap();
+        assert!(e.contains("does not accept anonymous"), "{e}");
+        // A server that does not trust us.
+        let mut cfg = secure_cfg();
+        cfg.reject_secure = true;
+        let port = test_server_cfg(cfg);
+        let url2 = format!("opc.tcp://127.0.0.1:{port}");
+        opts.policy = Policy::Basic256Sha256;
+        opts.mode = 3;
+        opts.login = Login::Anonymous;
+        let (c, eps) = discover_at(&url2);
+        let e = with_hint(open_session(c, &eps, &opts, &log, &|_| {}).err().unwrap());
+        assert!(e.contains("BadSecurityChecksFailed"), "{e}");
+        assert!(e.contains("trusted list"), "{e}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn worker_against_test_server() {
         let port = test_server();
         let (h, rx) = start(
             format!("opc.tcp://127.0.0.1:{port}"),
-            Auth::Anonymous,
+            Auth::Session(SessionOpts::anonymous_none()),
             Duration::from_secs(5),
         );
         let mut session = false;
@@ -2651,7 +3816,10 @@ pub(crate) mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !(session && browsed) && Instant::now() < deadline {
             match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
-                Event::Session(_) => session = true,
+                Event::Session(s) => {
+                    assert_eq!(s.security, "None");
+                    session = true
+                }
                 Event::Browsed(n, r) => {
                     assert_eq!(n, NodeId::num(0, OBJECTS));
                     assert_eq!(r.unwrap().len(), 2);

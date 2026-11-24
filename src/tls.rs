@@ -78,7 +78,9 @@ impl ServerCertVerifier for Recorder {
         c: &CertificateDer<'_>,
         d: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls12_signature(m, c, d)
+        self.inner
+            .verify_tls12_signature(m, c, d)
+            .or_else(|e| verify_signature_raw(m, c, d).map_err(|_| e))
     }
     fn verify_tls13_signature(
         &self,
@@ -86,11 +88,41 @@ impl ServerCertVerifier for Recorder {
         c: &CertificateDer<'_>,
         d: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls13_signature(m, c, d)
+        self.inner
+            .verify_tls13_signature(m, c, d)
+            .or_else(|e| verify_signature_raw(m, c, d).map_err(|_| e))
     }
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.inner.supported_verify_schemes()
     }
+}
+
+/// Check a handshake signature with the certificate's public key directly.
+/// webpki refuses to parse X.509 v1 certificates (still common on
+/// self-made broker / device certificates), so when the certificate is not
+/// being verified anyway this proves the peer holds the key without
+/// webpki's certificate parser.
+pub fn verify_signature_raw(
+    message: &[u8],
+    cert: &CertificateDer<'_>,
+    dss: &DigitallySignedStruct,
+) -> Result<HandshakeSignatureValid, rustls::Error> {
+    let bad = || rustls::Error::InvalidCertificate(rustls::CertificateError::BadSignature);
+    let (_, x) = x509_parser::parse_x509_certificate(cert.as_ref()).map_err(|_| bad())?;
+    let key = &x.public_key().subject_public_key.data;
+    let provider = rustls::crypto::ring::default_provider();
+    for (scheme, algs) in provider.signature_verification_algorithms.mapping {
+        if *scheme != dss.scheme {
+            continue;
+        }
+        if algs
+            .iter()
+            .any(|a| a.verify_signature(key, message, dss.signature()).is_ok())
+        {
+            return Ok(HandshakeSignatureValid::assertion());
+        }
+    }
+    Err(bad())
 }
 
 fn describe_error(e: &rustls::Error) -> String {
@@ -107,6 +139,11 @@ fn describe_error(e: &rustls::Error) -> String {
             }
             C::Revoked => "certificate has been revoked".into(),
             C::BadSignature => "bad certificate signature".into(),
+            C::Other(o) if format!("{o:?}").contains("UnsupportedCertVersion") => {
+                "X.509 v1 certificate (no extensions), which TLS libraries no longer verify; \
+                 re-issue it as v3 with a subjectAltName"
+                    .into()
+            }
             other => format!("{other:?}"),
         },
         other => other.to_string(),
@@ -382,16 +419,41 @@ fn io_err(e: &std::io::Error) -> String {
 /// A definite "no" from the server (alert / incompatible), not a network error.
 const REFUSED: &str = "handshake refused (version / cipher not supported)";
 
-fn connect(host: &str, port: u16, wait: Duration) -> Result<(TcpStream, SocketAddr), String> {
-    let addr = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
+/// TCP connection to the first of `host`'s addresses that answers (a name
+/// such as "localhost" often has an IPv6 address nothing listens on).
+pub fn connect(host: &str, port: u16, wait: Duration) -> Result<(TcpStream, SocketAddr), String> {
+    let all: Vec<SocketAddr> = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
         .map_err(|e| format!("cannot resolve {host}: {e}"))?
-        .next()
-        .ok_or_else(|| format!("{host}: no address"))?;
-    let s =
-        TcpStream::connect_timeout(&addr, wait).map_err(|e| format!("{addr}: {}", io_err(&e)))?;
-    s.set_read_timeout(Some(wait)).ok();
-    s.set_write_timeout(Some(wait)).ok();
-    Ok((s, addr))
+        .collect();
+    if all.is_empty() {
+        return Err(format!("{host}: no address"));
+    }
+    // At most two per family, in the resolver's order.
+    let (mut v4, mut v6) = (0, 0);
+    let addrs: Vec<SocketAddr> = all
+        .into_iter()
+        .filter(|a| {
+            let n = if a.is_ipv4() { &mut v4 } else { &mut v6 };
+            *n += 1;
+            *n <= 2
+        })
+        .collect();
+    connect_first(&addrs, wait)
+}
+
+fn connect_first(addrs: &[SocketAddr], wait: Duration) -> Result<(TcpStream, SocketAddr), String> {
+    let mut errors = Vec::new();
+    for addr in addrs {
+        match TcpStream::connect_timeout(addr, wait) {
+            Ok(s) => {
+                s.set_read_timeout(Some(wait)).ok();
+                s.set_write_timeout(Some(wait)).ok();
+                return Ok((s, *addr));
+            }
+            Err(e) => errors.push(format!("{addr}: {}", io_err(&e))),
+        }
+    }
+    Err(errors.join("; "))
 }
 
 fn handshake(
@@ -751,6 +813,21 @@ pub fn connect_tls(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn falls_back_to_the_next_address() {
+        // A closed port first, then a listener: the second must be used.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead = closed.local_addr().unwrap();
+        drop(closed);
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let live = l.local_addr().unwrap();
+        let wait = Duration::from_secs(5);
+        let (_s, used) = connect_first(&[dead, live], wait).unwrap();
+        assert_eq!(used, live);
+        let e = connect_first(&[dead], wait).unwrap_err();
+        assert!(e.contains(&dead.to_string()), "{e}");
+    }
 
     #[test]
     fn names_and_targets() {

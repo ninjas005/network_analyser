@@ -3,6 +3,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
@@ -23,6 +25,25 @@ pub struct Config {
     pub clean: bool,
     pub v5: bool,
     pub timeout: Duration,
+    /// Private CA and / or client certificate (mutual TLS).
+    pub tls_files: TlsFiles,
+}
+
+/// Certificate files for TLS: a CA to trust instead of the system store, and
+/// a client certificate + key for mutual TLS.
+#[derive(Clone, Debug, Default)]
+pub struct TlsFiles {
+    /// CA certificate(s), PEM or DER. `None` = system trust store.
+    pub ca: Option<PathBuf>,
+    /// Client certificate chain (PEM or DER) and private key (PKCS#8,
+    /// PKCS#1 or SEC1; PEM or DER).
+    pub client: Option<(PathBuf, PathBuf)>,
+}
+
+impl TlsFiles {
+    pub fn is_empty(&self) -> bool {
+        self.ca.is_none() && self.client.is_none()
+    }
 }
 
 /// "mqtt://host:1883", "mqtts://host", "ssl://h:8883", "host", "host:port".
@@ -652,7 +673,9 @@ pub fn connect(cfg: Config) -> (Session, Receiver<Event>) {
     let (etx, erx) = channel();
     std::thread::spawn(move || {
         if let Err(e) = run(cfg, crx, &etx) {
-            let _ = etx.send(Event::Error(e));
+            // TLS 1.3 brokers reject a client certificate after the
+            // handshake, so the alert can surface on any read.
+            let _ = etx.send(Event::Error(tls_hint(&e)));
         }
     });
     (Session { tx }, erx)
@@ -689,9 +712,31 @@ fn run(cfg: Config, rx: Receiver<Cmd>, tx: &Sender<Event>) -> Result<(), String>
             if cfg.tls { " (TLS)" } else { "" }
         ),
     );
-    let (s, conn) = open(&cfg.host, cfg.port, cfg.tls, cfg.insecure, cfg.timeout)?;
+    let (s, conn) = if cfg.tls && !cfg.tls_files.is_empty() {
+        if let Some(ca) = &cfg.tls_files.ca {
+            log(Lvl::Info, format!("Trusting CA from {}", ca.display()));
+        }
+        if let Some((c, _)) = &cfg.tls_files.client {
+            log(
+                Lvl::Info,
+                format!("Client certificate: {}", client_cert_summary(c)?),
+            );
+        }
+        open_with_files(
+            &cfg.host,
+            cfg.port,
+            &cfg.tls_files,
+            cfg.insecure,
+            cfg.timeout,
+        )?
+    } else {
+        open(&cfg.host, cfg.port, cfg.tls, cfg.insecure, cfg.timeout)?
+    };
     if let Some(t) = &conn.tls {
         log(Lvl::Info, format!("TLS: {t}"));
+    }
+    if let Some(c) = &conn.cert {
+        log(Lvl::Info, format!("Broker certificate: {c}"));
     }
     if let Some(e) = &conn.cert_error {
         log(Lvl::Warn, format!("Certificate not trusted: {e}"));
@@ -708,7 +753,16 @@ fn run(cfg: Config, rx: Receiver<Cmd>, tx: &Sender<Event>) -> Result<(), String>
         last_sent: Instant::now(),
     };
     let t0 = Instant::now();
-    io.send(&encode_connect(&cfg))?;
+    if let Err(e) = io.send(&encode_connect(&cfg)) {
+        // A TLS alert may already be waiting and says more than the failed
+        // write does.
+        io.s.set_read_timeout(Duration::from_millis(500));
+        let why = match io.s.read(&mut [0u8; 256]) {
+            Err(r) if r.kind() == std::io::ErrorKind::InvalidData => r.to_string(),
+            _ => e,
+        };
+        return Err(early_drop(&cfg, why));
+    }
     log(
         Lvl::Info,
         format!(
@@ -970,7 +1024,7 @@ fn run(cfg: Config, rx: Receiver<Cmd>, tx: &Sender<Event>) -> Result<(), String>
                 return Err(if connected {
                     "broker closed the connection (another client with the same id, or an ACL / protocol violation)".into()
                 } else {
-                    "broker closed the connection before CONNACK".into()
+                    early_drop(&cfg, "broker closed the connection before CONNACK".into())
                 });
             }
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
@@ -979,27 +1033,324 @@ fn run(cfg: Config, rx: Receiver<Cmd>, tx: &Sender<Event>) -> Result<(), String>
                     e.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) => {}
+            Err(e) if !connected => return Err(early_drop(&cfg, io_err(&e))),
             Err(e) => return Err(io_err(&e)),
         }
     }
 }
 
+/// The connection ended before CONNACK. A TLS 1.3 broker rejects a client
+/// certificate after the handshake, and the alert can be lost when the
+/// connection is reset (typically on Windows), so name the likely cause.
+fn early_drop(cfg: &Config, e: String) -> String {
+    let dropped = ["closed", "reset", "aborted"].iter().any(|w| e.contains(w));
+    if !cfg.tls || !dropped {
+        return e;
+    }
+    if cfg.tls_files.client.is_some() {
+        format!(
+            "{e} — the broker may have rejected the client certificate \
+             (not signed by a CA it trusts, or expired)"
+        )
+    } else {
+        format!("{e} — the broker may require a client certificate (choose Certificates)")
+    }
+}
+
+// ---------------------------------------------------------------- TLS with files (private CA, mutual TLS)
+
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+
+fn read_file(p: &Path, what: &str) -> Result<Vec<u8>, String> {
+    std::fs::read(p).map_err(|e| format!("{what} {}: {e}", p.display()))
+}
+
+/// Certificates from a PEM (one or more blocks) or a single DER file.
+pub fn load_certs(p: &Path, what: &str) -> Result<Vec<CertificateDer<'static>>, String> {
+    let bytes = read_file(p, what)?;
+    if bytes.starts_with(b"-----") || bytes.windows(11).any(|w| w == b"-----BEGIN ") {
+        let certs: Vec<_> = CertificateDer::pem_slice_iter(&bytes)
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("{what} {}: bad PEM: {e:?}", p.display()))?;
+        if certs.is_empty() {
+            return Err(format!(
+                "{what} {}: no CERTIFICATE block found",
+                p.display()
+            ));
+        }
+        Ok(certs)
+    } else if bytes.first() == Some(&0x30) {
+        Ok(vec![CertificateDer::from(bytes)])
+    } else {
+        Err(format!(
+            "{what} {}: not a PEM or DER certificate",
+            p.display()
+        ))
+    }
+}
+
+/// A private key from PEM (PKCS#8, PKCS#1 "RSA", SEC1 "EC") or DER.
+pub fn load_key(p: &Path) -> Result<PrivateKeyDer<'static>, String> {
+    let bytes = read_file(p, "client key")?;
+    let text = String::from_utf8_lossy(&bytes);
+    if text.contains("ENCRYPTED PRIVATE KEY") || text.contains("Proc-Type: 4,ENCRYPTED") {
+        return Err(format!(
+            "client key {}: the key is password-protected; decrypt it first \
+             (openssl pkey -in key.pem -out key-plain.pem)",
+            p.display()
+        ));
+    }
+    if text.contains("-----BEGIN ") {
+        return PrivateKeyDer::from_pem_slice(&bytes).map_err(|e| {
+            format!(
+                "client key {}: no usable private key ({e:?}); expected PKCS#8, RSA or EC PEM",
+                p.display()
+            )
+        });
+    }
+    PrivateKeyDer::try_from(bytes).map_err(|e| format!("client key {}: {e}", p.display()))
+}
+
+/// "CN=… — issued by … — N days left" for the log / UI.
+pub fn client_cert_summary(p: &Path) -> Result<String, String> {
+    let certs = load_certs(p, "client certificate")?;
+    let c = crate::tls::parse_cert(certs[0].as_ref())
+        .map_err(|e| format!("client certificate {}: {e}", p.display()))?;
+    Ok(format!(
+        "{} — issued by {} — {}",
+        c.subject,
+        c.issuer,
+        if c.days_left < 0 {
+            format!("EXPIRED {} days ago", -c.days_left)
+        } else {
+            format!("{} days left", c.days_left)
+        }
+    ))
+}
+
+/// Accepts any server certificate but still checks handshake signatures
+/// (the "Accept invalid cert" option with a private CA / client cert).
+#[derive(Debug)]
+struct AcceptAny(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAny {
+    fn verify_server_cert(
+        &self,
+        _: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: &ServerName<'_>,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        m: &[u8],
+        c: &CertificateDer<'_>,
+        d: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(m, c, d, &self.0.signature_verification_algorithms)
+            .or_else(|e| crate::tls::verify_signature_raw(m, c, d).map_err(|_| e))
+    }
+    fn verify_tls13_signature(
+        &self,
+        m: &[u8],
+        c: &CertificateDer<'_>,
+        d: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(m, c, d, &self.0.signature_verification_algorithms)
+            .or_else(|e| crate::tls::verify_signature_raw(m, c, d).map_err(|_| e))
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// Build the rustls client config for `files`.
+pub fn files_config(files: &TlsFiles, insecure: bool) -> Result<rustls::ClientConfig, String> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?;
+    let builder = if insecure {
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAny(provider)))
+    } else {
+        let roots = match &files.ca {
+            Some(p) => {
+                let mut store = rustls::RootCertStore::empty();
+                for c in load_certs(p, "CA certificate")? {
+                    store
+                        .add(c)
+                        .map_err(|e| format!("CA certificate {}: {e}", p.display()))?;
+                }
+                Arc::new(store)
+            }
+            None => crate::tls::roots(),
+        };
+        builder.with_root_certificates(roots)
+    };
+    match &files.client {
+        Some((cert, key)) => {
+            let chain = load_certs(cert, "client certificate")?;
+            let key = load_key(key)?;
+            builder
+                .with_client_auth_cert(chain, key)
+                .map_err(|e| format!("client certificate and key: {}", tls_hint(&e.to_string())))
+        }
+        None => Ok(builder.with_no_client_auth()),
+    }
+}
+
+/// Explain the TLS failures that mutual TLS typically produces.
+pub fn tls_hint(e: &str) -> String {
+    let l = e.to_ascii_lowercase();
+    let hint = if l.contains("certificaterequired") || l.contains("certificate required") {
+        "the broker requires a client certificate — choose Certificates and add one"
+    } else if l.contains("unknownca") || l.contains("unknown ca") {
+        "the broker does not trust the CA that signed the client certificate"
+    } else if l.contains("certificateunknown") || l.contains("certificate unknown") {
+        "the broker could not verify the client certificate (not signed by a CA it trusts, \
+         or missing the clientAuth usage)"
+    } else if l.contains("badcertificate") || l.contains("bad certificate") {
+        "the broker rejected the client certificate (wrong CA, expired, or wrong key usage)"
+    } else if l.contains("unsupportedcertversion") {
+        "the broker uses an X.509 v1 certificate, which cannot be verified; re-issue it as v3 \
+         (openssl x509 -req … -extfile with subjectAltName) or use Accept invalid cert"
+    } else if l.contains("certificateexpired") {
+        "a certificate has expired"
+    } else if l.contains("unknownissuer") {
+        "the broker's certificate is not signed by the chosen CA (or the system store)"
+    } else if l.contains("notvalidforname") {
+        "the broker's certificate does not match the host name; connect by the name in the \
+         certificate, or use Accept invalid cert"
+    } else if l.contains("keymismatch") || l.contains("inconsistent") {
+        "the private key does not belong to the client certificate"
+    } else if l.contains("unsupported") && l.contains("key") {
+        "unsupported key type; use RSA, ECDSA P-256/P-384 or Ed25519"
+    } else {
+        return e.to_string();
+    };
+    format!("{e} — {hint}")
+}
+
+/// Like [`open`] (always TLS) with a private CA and / or a client certificate.
+pub fn open_with_files(
+    host: &str,
+    port: u16,
+    files: &TlsFiles,
+    insecure: bool,
+    wait: Duration,
+) -> Result<(NetStream, ConnInfo), String> {
+    let cfg = Arc::new(files_config(files, insecure)?);
+    let t0 = Instant::now();
+    let sni = host.trim_start_matches('[').trim_end_matches(']');
+    let name = ServerName::try_from(sni.to_string()).map_err(|e| e.to_string())?;
+    let mut conn = rustls::ClientConnection::new(cfg, name).map_err(|e| e.to_string())?;
+    let (mut sock, addr) = crate::tls::connect(sni, port, wait)?;
+    sock.set_nodelay(true).ok();
+    while conn.is_handshaking() {
+        conn.complete_io(&mut sock)
+            .map_err(|e| format!("TLS: {}", tls_hint(&io_err(&e))))?;
+    }
+    let mut info = ConnInfo {
+        addr: Some(addr),
+        connect_ms: t0.elapsed().as_secs_f64() * 1000.0,
+        ..Default::default()
+    };
+    let v = match conn.protocol_version() {
+        Some(rustls::ProtocolVersion::TLSv1_3) => "TLS 1.3",
+        Some(rustls::ProtocolVersion::TLSv1_2) => "TLS 1.2",
+        _ => "TLS",
+    };
+    let suite = conn
+        .negotiated_cipher_suite()
+        .map(|c| format!("{:?}", c.suite()))
+        .unwrap_or_default();
+    info.tls = Some(format!(
+        "{v} {suite}{}",
+        if files.client.is_some() {
+            " · mutual TLS (client certificate sent if requested)"
+        } else {
+            ""
+        }
+    ));
+    info.cert = conn
+        .peer_certificates()
+        .and_then(|c| c.first())
+        .and_then(|c| crate::tls::parse_cert(c.as_ref()).ok())
+        .map(|c| {
+            format!(
+                "{} — issued by {} — {} days left",
+                c.subject, c.issuer, c.days_left
+            )
+        });
+    Ok((
+        NetStream::Tls(Box::new(rustls::StreamOwned::new(conn, sock))),
+        info,
+    ))
+}
+
 // ---------------------------------------------------------------- CLI
 
-/// `--mqtt BROKER [FILTER] [SECONDS]`
+/// `--mqtt BROKER [FILTER] [SECONDS] [--user U --password P] [--ca F] [--cert F --key F] [--insecure]`
 pub fn cli(args: &[String]) {
-    let Some(broker) = args.first() else {
-        eprintln!(
-            "usage: --mqtt BROKER [TOPIC-FILTER] [SECONDS]   e.g. --mqtt test.mosquitto.org '$SYS/#' 5"
-        );
+    const USAGE: &str = "usage: --mqtt BROKER [TOPIC-FILTER] [SECONDS] [--user U --password P] \
+         [--ca CA.pem] [--cert CLIENT.pem --key CLIENT.key] [--insecure]\n  \
+         e.g. --mqtt test.mosquitto.org '$SYS/#' 5";
+    let mut pos: Vec<&String> = Vec::new();
+    let (mut user, mut pass, mut insecure) = (None, None, false);
+    let mut files = TlsFiles::default();
+    let (mut cert, mut key): (Option<PathBuf>, Option<PathBuf>) = (None, None);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut val = |name: &str| {
+            it.next().cloned().unwrap_or_else(|| {
+                eprintln!("{name}: missing value\n{USAGE}");
+                std::process::exit(2)
+            })
+        };
+        match a.as_str() {
+            "--user" | "-u" => user = Some(val(a)),
+            "--password" | "-P" => pass = Some(val(a)),
+            "--ca" | "--cafile" => files.ca = Some(val(a).into()),
+            "--cert" => cert = Some(val(a).into()),
+            "--key" => key = Some(val(a).into()),
+            "--insecure" | "-k" => insecure = true,
+            _ => pos.push(a),
+        }
+    }
+    match (cert, key) {
+        (Some(c), Some(k)) => files.client = Some((c, k)),
+        (None, None) => {}
+        _ => {
+            eprintln!("--cert and --key must be given together\n{USAGE}");
+            std::process::exit(2)
+        }
+    }
+    let Some(broker) = pos.first() else {
+        eprintln!("{USAGE}");
         std::process::exit(2)
     };
-    let (host, port, tls) = parse_broker(broker).unwrap_or_else(|e| {
+    let (host, mut port, mut tls) = parse_broker(broker).unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(2)
     });
-    let filter = args.get(1).cloned().unwrap_or_else(|| "#".into());
-    let secs: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
+    if !files.is_empty() && !tls {
+        // Certificates imply TLS; move the default port along.
+        tls = true;
+        if port == 1883 {
+            port = 8883;
+        }
+    }
+    let filter = pos
+        .get(1)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "#".into());
+    let secs: u64 = pos.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
     if let Err(e) = validate_filter(&filter) {
         eprintln!("{e}");
         std::process::exit(2)
@@ -1008,14 +1359,15 @@ pub fn cli(args: &[String]) {
         host,
         port,
         tls,
-        insecure: false,
+        insecure,
         client_id: random_client_id(),
-        username: None,
-        password: None,
+        username: user,
+        password: pass,
         keepalive: 30,
         clean: true,
         v5: false,
         timeout: Duration::from_secs(10),
+        tls_files: files,
     });
     sess.send(Cmd::Subscribe(filter, 0));
     let mut end: Option<Instant> = None;
@@ -1085,6 +1437,7 @@ mod tests {
             clean: true,
             v5,
             timeout: Duration::from_secs(5),
+            tls_files: TlsFiles::default(),
         }
     }
 
@@ -1352,5 +1705,204 @@ mod tests {
             }
             assert_eq!((got, acks), (3, 2), "v5={v5}");
         }
+    }
+}
+
+#[cfg(test)]
+mod mtls_tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/testdata/mqtt")
+            .join(name)
+    }
+
+    /// One-shot TLS broker on 127.0.0.1 that requires a client certificate
+    /// signed by the test CA, then answers CONNECT with CONNACK.
+    /// Returns the port and a receiver with the server-side outcome.
+    fn broker() -> (u16, Receiver<Result<(), String>>) {
+        use rustls::server::WebPkiClientVerifier;
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut roots = rustls::RootCertStore::empty();
+        for c in load_certs(&fixture("ca.pem"), "ca").unwrap() {
+            roots.add(c).unwrap();
+        }
+        let verifier =
+            WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone())
+                .build()
+                .unwrap();
+        let cfg = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(
+                load_certs(&fixture("server.pem"), "server").unwrap(),
+                load_key(&fixture("server.key")).unwrap(),
+            )
+            .unwrap();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let r = (|| -> Result<(), String> {
+                let (mut sock, _) = l.accept().map_err(|e| e.to_string())?;
+                sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                let mut conn =
+                    rustls::ServerConnection::new(Arc::new(cfg)).map_err(|e| e.to_string())?;
+                while conn.is_handshaking() {
+                    conn.complete_io(&mut sock).map_err(|e| e.to_string())?;
+                }
+                let mut s = rustls::StreamOwned::new(conn, sock);
+                let mut hdr = [0u8; 2];
+                s.read_exact(&mut hdr).map_err(|e| e.to_string())?;
+                if hdr[0] >> 4 != 1 {
+                    return Err("expected CONNECT".into());
+                }
+                let mut body = vec![0u8; hdr[1] as usize];
+                s.read_exact(&mut body).map_err(|e| e.to_string())?;
+                s.write_all(&[0x20, 0x02, 0x00, 0x00])
+                    .map_err(|e| e.to_string())?;
+                s.flush().map_err(|e| e.to_string())?;
+                std::thread::sleep(Duration::from_millis(300));
+                Ok(())
+            })();
+            let _ = tx.send(r);
+        });
+        (port, rx)
+    }
+
+    fn cfg(port: u16, files: TlsFiles) -> Config {
+        Config {
+            host: "localhost".into(),
+            port,
+            tls: true,
+            insecure: false,
+            client_id: "mtls-test".into(),
+            username: None,
+            password: None,
+            keepalive: 30,
+            clean: true,
+            v5: false,
+            timeout: Duration::from_secs(5),
+            tls_files: files,
+        }
+    }
+
+    /// First Connected / Error / Closed outcome of a session.
+    fn outcome(rx: &Receiver<Event>) -> Result<String, String> {
+        let end = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < end {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(Event::Connected { conn, .. }) => return Ok(conn.tls.unwrap_or_default()),
+                Ok(Event::Error(e)) | Ok(Event::Closed(e)) => return Err(e),
+                Ok(_) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(_) => return Err("session ended".into()),
+            }
+        }
+        Err("no outcome".into())
+    }
+
+    #[test]
+    fn mutual_tls_connects_with_ca_and_client_cert() {
+        let (port, srv) = broker();
+        let (_s, rx) = connect(cfg(
+            port,
+            TlsFiles {
+                ca: Some(fixture("ca.pem")),
+                client: Some((fixture("client.pem"), fixture("client.key"))),
+            },
+        ));
+        let tls = outcome(&rx).expect("connected");
+        assert!(tls.contains("mutual TLS"), "{tls}");
+        srv.recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .expect("broker side ok");
+    }
+
+    #[test]
+    fn broker_rejects_missing_or_foreign_client_cert() {
+        for client in [None, Some((fixture("rogue.pem"), fixture("rogue.key")))] {
+            let (port, srv) = broker();
+            let (_s, rx) = connect(cfg(
+                port,
+                TlsFiles {
+                    ca: Some(fixture("ca.pem")),
+                    client: client.clone(),
+                },
+            ));
+            let e = outcome(&rx).expect_err("must be rejected");
+            assert!(e.contains(" — "), "no explanation in: {e}");
+            assert!(srv.recv_timeout(Duration::from_secs(5)).unwrap().is_err());
+        }
+    }
+
+    #[test]
+    fn server_cert_must_chain_to_the_chosen_ca() {
+        let (port, _srv) = broker();
+        // Trust a different CA (the rogue self-signed cert) → unknown issuer.
+        let (_s, rx) = connect(cfg(
+            port,
+            TlsFiles {
+                ca: Some(fixture("rogue.pem")),
+                client: Some((fixture("client.pem"), fixture("client.key"))),
+            },
+        ));
+        let e = outcome(&rx).expect_err("untrusted broker");
+        assert!(e.to_ascii_lowercase().contains("unknownissuer"), "{e}");
+    }
+
+    #[test]
+    fn dropped_connections_are_explained() {
+        // What Windows reports when the TLS alert is lost.
+        for e in [
+            "connection aborted",
+            "connection reset by the server",
+            "send failed: connection closed by the server",
+        ] {
+            let m = early_drop(&cfg(1, TlsFiles::default()), e.into());
+            assert!(m.contains("may require a client certificate"), "{m}");
+            let files = TlsFiles {
+                ca: None,
+                client: Some((fixture("client.pem"), fixture("client.key"))),
+            };
+            let m = early_drop(&cfg(1, files), e.into());
+            assert!(m.contains("may have rejected"), "{m}");
+            let plain = Config {
+                tls: false,
+                ..cfg(1, TlsFiles::default())
+            };
+            assert_eq!(early_drop(&plain, e.into()), e);
+        }
+        // Alerts keep their own, precise explanation.
+        let alert = "received fatal alert: UnknownCA";
+        assert_eq!(
+            early_drop(&cfg(1, TlsFiles::default()), alert.into()),
+            alert
+        );
+    }
+
+    #[test]
+    fn key_file_problems_are_explained() {
+        let e = load_key(&fixture("client-encrypted.key")).unwrap_err();
+        assert!(e.contains("password-protected"), "{e}");
+        // Certificate and key that don't belong together.
+        let e = files_config(
+            &TlsFiles {
+                ca: Some(fixture("ca.pem")),
+                client: Some((fixture("client.pem"), fixture("rogue.key"))),
+            },
+            false,
+        )
+        .unwrap_err();
+        assert!(e.contains("client certificate and key"), "{e}");
+        assert!(load_certs(&fixture("client.key"), "cert").is_err());
+        assert!(
+            client_cert_summary(&fixture("client.pem"))
+                .unwrap()
+                .contains("na-client")
+        );
     }
 }

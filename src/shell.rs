@@ -1,6 +1,6 @@
 //! Root view: header, segment sidebar, the active tool, update and quit dialogs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 
@@ -12,7 +12,7 @@ use gpui::{
 use crate::tools::{Segment, Tool};
 use crate::ui::ScannerView;
 use crate::updater::{self, InstallKind, Progress, Release};
-use crate::widgets::{C, button, chip, progress, tip};
+use crate::widgets::{Accept, C, Submit, TextInput, button, chip, progress, tip};
 
 actions!(
     network_analyser,
@@ -59,6 +59,10 @@ pub struct Shell {
     tool: Tool,
     sidebar: bool,
     sidebar_scroll: ScrollHandle,
+    /// Segments whose tools are shown.
+    expanded: HashSet<Segment>,
+    /// Sidebar tool filter.
+    filter: Entity<TextInput>,
     confirm_quit: bool,
     lan: Entity<ScannerView>,
     views: HashMap<Tool, (AnyView, FocusHandle)>,
@@ -69,8 +73,27 @@ impl Shell {
         kiosk: bool,
         lan: Entity<ScannerView>,
         auto_update_check: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let filter = cx.new(|cx| TextInput::new(cx, "", "Filter tools…", Accept::Any).max_len(40));
+        // Re-render the list while typing; Enter opens the first match.
+        cx.observe(&filter, |_, _, cx| cx.notify()).detach();
+        cx.subscribe_in(&filter, window, |this, _, _: &Submit, window, cx| {
+            if let Some(t) = this.visible_tools(cx).first().copied() {
+                this.filter.update(cx, |f, cx| f.set("", cx));
+                this.select(t, window, cx);
+            }
+        })
+        .detach();
+        let expanded = match crate::settings::get().sidebar_expanded {
+            Some(list) => Segment::ALL
+                .into_iter()
+                .filter(|s| list.iter().any(|l| l == s.label()))
+                .collect(),
+            // First run: only the group of the opening tool (added by select).
+            None => HashSet::new(),
+        };
         updater::cleanup_previous_update();
         if auto_update_check {
             cx.spawn(async move |this, cx| {
@@ -90,6 +113,8 @@ impl Shell {
             tool: Tool::LanScan,
             sidebar: true,
             sidebar_scroll: ScrollHandle::new(),
+            expanded,
+            filter,
             confirm_quit: false,
             lan,
             views: HashMap::new(),
@@ -99,10 +124,18 @@ impl Shell {
     /// Switch tool, creating its view on first use, and focus it.
     pub fn select(&mut self, tool: Tool, window: &mut Window, cx: &mut Context<Self>) {
         self.tool = tool;
+        if self.expanded.insert(tool.segment()) {
+            self.save_expanded();
+        }
         // Keep the selected entry visible (startup with --tool, Alt+↑/↓).
         // On the very first frame the container's bounds are not known yet,
         // so repeat the request on the next frame.
-        let (handle, row) = (self.sidebar_scroll.clone(), sidebar_row(tool));
+        let row = self
+            .sidebar_rows(cx)
+            .iter()
+            .position(|r| matches!(r, Row::Tool(t) if *t == tool))
+            .unwrap_or(0);
+        let handle = self.sidebar_scroll.clone();
         handle.scroll_to_item(row);
         window.on_next_frame(move |window, _| {
             handle.scroll_to_item(row);
@@ -132,75 +165,240 @@ impl Shell {
             .unwrap_or_else(|| self.lan.clone().into())
     }
 
+    fn save_expanded(&self) {
+        let list: Vec<String> = Segment::ALL
+            .into_iter()
+            .filter(|s| self.expanded.contains(s))
+            .map(|s| s.label().to_string())
+            .collect();
+        let _ = crate::settings::update(|s| s.sidebar_expanded = Some(list));
+    }
+
+    fn set_all_expanded(&mut self, open: bool) {
+        self.expanded = if open {
+            Segment::ALL.into_iter().collect()
+        } else {
+            // Keep the current tool's group open so the selection stays visible.
+            [self.tool.segment()].into_iter().collect()
+        };
+        self.save_expanded();
+    }
+
+    fn toggle_segment(&mut self, seg: Segment) {
+        if !self.expanded.remove(&seg) {
+            self.expanded.insert(seg);
+        }
+        self.save_expanded();
+    }
+
+    fn filter_text(&self, cx: &App) -> String {
+        self.filter.read(cx).value.trim().to_lowercase()
+    }
+
+    /// Tools matching the filter (all tools when it is empty).
+    fn visible_tools(&self, cx: &App) -> Vec<Tool> {
+        let q = self.filter_text(cx);
+        Tool::ALL
+            .into_iter()
+            .filter(|t| {
+                q.is_empty()
+                    || t.label().to_lowercase().contains(&q)
+                    || t.slug().contains(&q)
+                    || t.describe().to_lowercase().contains(&q)
+                    || t.segment().label().to_lowercase().contains(&q)
+            })
+            .collect()
+    }
+
+    /// The sidebar list: a header per segment, then its tools when the
+    /// segment is expanded (or always while filtering).
+    fn sidebar_rows(&self, cx: &App) -> Vec<Row> {
+        let filtering = !self.filter_text(cx).is_empty();
+        sidebar_rows(&self.visible_tools(cx), &self.expanded, filtering)
+    }
+
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity().downgrade();
-        // Segment headers and tool rows are direct children of the scroll
-        // container so the scroll handle can bring a row into view by index
-        // (see `sidebar_row`).
-        let mut rows: Vec<gpui::AnyElement> = Vec::new();
-        for seg in Segment::ALL {
-            let tools: Vec<Tool> = Tool::ALL
-                .into_iter()
-                .filter(|t| t.segment() == seg)
-                .collect();
-            if tools.is_empty() {
-                continue;
-            }
-            rows.push(
-                div()
-                    .px_4()
-                    .pb_1()
-                    .when(!rows.is_empty(), |d| d.pt_3())
-                    .text_xs()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(rgb(C::MUTED))
-                    .child(seg.label().to_uppercase())
-                    .into_any_element(),
-            );
-            for t in tools {
-                let active = self.tool == t;
-                let view = view.clone();
-                rows.push(
-                    div()
-                        .id(t.slug())
-                        .mx_2()
-                        .px_3()
-                        .py(px(5.))
-                        .rounded_md()
-                        .text_sm()
-                        .whitespace_nowrap()
-                        .cursor_pointer()
-                        .bg(if active {
-                            rgb(C::SELECT).into()
-                        } else {
-                            Hsla::transparent_black()
-                        })
-                        .text_color(rgb(if active { C::TEXT } else { 0xb7c0cf }))
-                        .when(active, |d| d.font_weight(gpui::FontWeight::SEMIBOLD))
-                        .hover(|s| s.bg(rgb(C::PANEL2)).text_color(rgb(C::TEXT)))
-                        .child(t.label())
-                        .tooltip(tip(t.describe()))
-                        .on_click(move |_, window, cx| {
-                            view.update(cx, |this, cx| this.select(t, window, cx)).ok();
-                        })
-                        .into_any_element(),
-                );
+        let filtering = !self.filter_text(cx).is_empty();
+        let rows = self.sidebar_rows(cx);
+        let all_open = Segment::ALL.iter().all(|s| self.expanded.contains(s));
+        let mut items: Vec<gpui::AnyElement> = Vec::new();
+        for (i, row) in rows.iter().enumerate() {
+            match *row {
+                Row::Header { seg, count, open } => {
+                    let active_inside = self.tool.segment() == seg;
+                    let view = view.clone();
+                    items.push(
+                        div()
+                            .id(seg.label())
+                            .mx_2()
+                            .when(i > 0, |d| d.mt_1())
+                            .px_2()
+                            .py(px(6.))
+                            .rounded_md()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(C::PANEL2)))
+                            .child(
+                                div()
+                                    .w(px(10.))
+                                    .flex_none()
+                                    .text_xs()
+                                    .text_color(rgb(C::MUTED))
+                                    .child(if open { "▾" } else { "▸" }),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(rgb(if active_inside && !open {
+                                        C::ACCENT
+                                    } else if open {
+                                        C::TEXT
+                                    } else {
+                                        0xb7c0cf
+                                    }))
+                                    .child(seg.label()),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .px(px(6.))
+                                    .rounded_full()
+                                    .bg(rgb(C::BG))
+                                    .text_xs()
+                                    .text_color(rgb(C::MUTED))
+                                    .child(count.to_string()),
+                            )
+                            .when(!filtering, |d| {
+                                d.on_click(move |_, _, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.toggle_segment(seg);
+                                        cx.notify();
+                                    })
+                                    .ok();
+                                })
+                            })
+                            .into_any_element(),
+                    );
+                }
+                Row::Tool(t) => {
+                    let active = self.tool == t;
+                    let view = view.clone();
+                    items.push(
+                        div()
+                            .id(t.slug())
+                            .ml(px(19.))
+                            .mr_2()
+                            .pl_3()
+                            .pr_2()
+                            .py(px(5.))
+                            .border_l_2()
+                            .border_color(rgb(if active { C::ACCENT } else { C::BORDER }))
+                            .rounded_r_md()
+                            .text_sm()
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .cursor_pointer()
+                            .bg(if active {
+                                rgb(C::SELECT).into()
+                            } else {
+                                Hsla::transparent_black()
+                            })
+                            .text_color(rgb(if active { C::TEXT } else { 0xb7c0cf }))
+                            .when(active, |d| d.font_weight(gpui::FontWeight::SEMIBOLD))
+                            .hover(|s| s.bg(rgb(C::PANEL2)).text_color(rgb(C::TEXT)))
+                            .child(t.label())
+                            .tooltip(tip(t.describe()))
+                            .on_click(move |_, window, cx| {
+                                view.update(cx, |this, cx| this.select(t, window, cx)).ok();
+                            })
+                            .into_any_element(),
+                    );
+                }
             }
         }
+        if rows.is_empty() {
+            items.push(
+                div()
+                    .px_4()
+                    .py_2()
+                    .text_xs()
+                    .text_color(rgb(C::MUTED))
+                    .child("No tool matches")
+                    .into_any_element(),
+            );
+        }
+        let v2 = view.clone();
         div()
-            .id("sidebar")
-            .w(px(212.))
+            .w(px(224.))
             .flex_none()
             .h_full()
-            .py_3()
             .flex()
             .flex_col()
             .bg(rgb(C::PANEL))
             .border_r_1()
             .border_color(rgb(C::BORDER))
-            .overflow_y_scroll()
-            .track_scroll(&self.sidebar_scroll)
-            .children(rows)
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .px_3()
+                    .pt_3()
+                    .pb_2()
+                    .border_b_1()
+                    .border_color(rgb(C::BORDER))
+                    .child(self.filter.clone())
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .text_xs()
+                            .text_color(rgb(C::MUTED))
+                            .child(format!("{} tools", Tool::ALL.len()))
+                            .child(
+                                div()
+                                    .id("sidebar-all")
+                                    .cursor_pointer()
+                                    .px_2()
+                                    .rounded_sm()
+                                    .hover(|s| s.bg(rgb(C::PANEL2)).text_color(rgb(C::TEXT)))
+                                    .child(if all_open {
+                                        "Collapse all"
+                                    } else {
+                                        "Expand all"
+                                    })
+                                    .on_click(move |_, _, cx| {
+                                        v2.update(cx, |this, cx| {
+                                            this.set_all_expanded(!all_open);
+                                            cx.notify();
+                                        })
+                                        .ok();
+                                    }),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .id("sidebar")
+                    .flex_1()
+                    .min_h_0()
+                    .py_2()
+                    .flex()
+                    .flex_col()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.sidebar_scroll)
+                    .children(items),
+            )
     }
 
     fn toggle_fullscreen(
@@ -767,25 +965,41 @@ impl Render for Shell {
     }
 }
 
-/// Index of `tool`'s row among the sidebar's children (one header row per
-/// non-empty segment, then its tools).
-fn sidebar_row(tool: Tool) -> usize {
-    let mut row = 0;
+/// One sidebar line.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Row {
+    Header {
+        seg: Segment,
+        count: usize,
+        open: bool,
+    },
+    Tool(Tool),
+}
+
+/// Headers for segments with visible tools; tools under open segments
+/// (every segment is open while filtering).
+fn sidebar_rows(visible: &[Tool], expanded: &HashSet<Segment>, filtering: bool) -> Vec<Row> {
+    let mut rows = Vec::new();
     for seg in Segment::ALL {
-        let tools: Vec<Tool> = Tool::ALL
-            .into_iter()
+        let tools: Vec<Tool> = visible
+            .iter()
+            .copied()
             .filter(|t| t.segment() == seg)
             .collect();
         if tools.is_empty() {
             continue;
         }
-        row += 1;
-        if let Some(i) = tools.iter().position(|t| *t == tool) {
-            return row + i;
+        let open = filtering || expanded.contains(&seg);
+        rows.push(Row::Header {
+            seg,
+            count: tools.len(),
+            open,
+        });
+        if open {
+            rows.extend(tools.into_iter().map(Row::Tool));
         }
-        row += tools.len();
     }
-    0
+    rows
 }
 
 #[cfg(test)]
@@ -793,14 +1007,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sidebar_rows_count_headers() {
-        // First segment: header at 0, first tool at 1.
-        assert_eq!(sidebar_row(Tool::ALL[0]), 1);
-        let headers = Segment::ALL
-            .iter()
-            .filter(|s| Tool::ALL.iter().any(|t| t.segment() == **s))
-            .count();
-        let last = *Tool::ALL.last().unwrap();
-        assert_eq!(sidebar_row(last), Tool::ALL.len() + headers - 1);
+    fn collapsed_segments_hide_their_tools() {
+        let all = Tool::ALL.to_vec();
+        let none = HashSet::new();
+        let rows = sidebar_rows(&all, &none, false);
+        // Every segment collapsed: headers only.
+        assert!(
+            rows.iter()
+                .all(|r| matches!(r, Row::Header { open: false, .. }))
+        );
+        let n_segs = rows.len();
+        let open: HashSet<Segment> = [Segment::Iot].into_iter().collect();
+        let rows = sidebar_rows(&all, &open, false);
+        assert_eq!(rows.len(), n_segs + 2);
+        assert!(rows.contains(&Row::Tool(Tool::Mqtt)));
+        assert!(!rows.contains(&Row::Tool(Tool::Snmp)));
+        // Filtering shows matching tools under open headers only.
+        let rows = sidebar_rows(&[Tool::Mqtt, Tool::Ntp], &none, true);
+        assert_eq!(rows.len(), 4);
+        assert!(rows.contains(&Row::Tool(Tool::Ntp)));
     }
 }

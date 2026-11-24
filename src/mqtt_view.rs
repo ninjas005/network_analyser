@@ -237,6 +237,22 @@ enum Pane {
     Log,
 }
 
+/// How the client proves who it is.
+#[derive(Clone, Copy, PartialEq)]
+enum Auth {
+    Password,
+    /// Mutual TLS: CA + client certificate + key.
+    Certificates,
+}
+
+/// Which certificate field a Browse button fills.
+#[derive(Clone, Copy)]
+enum FileField {
+    Ca,
+    Cert,
+    Key,
+}
+
 pub struct MqttView {
     focus: FocusHandle,
     broker: Entity<TextInput>,
@@ -250,6 +266,12 @@ pub struct MqttView {
     search: Entity<TextInput>,
     tls: bool,
     insecure: bool,
+    auth: Auth,
+    ca_path: Entity<TextInput>,
+    cert_path: Entity<TextInput>,
+    key_path: Entity<TextInput>,
+    /// Summary of the chosen client certificate (or why it can't be read).
+    cert_info: Option<Result<String, String>>,
     v5: bool,
     clean: bool,
     sub_qos: u8,
@@ -293,6 +315,21 @@ pub struct MqttView {
 impl MqttView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let pass = cx.new(|cx| SecretInput::new(cx, "password", 120.));
+        let saved = crate::settings::get();
+        let path_input = |window: &mut Window, cx: &mut Context<Self>, v: &str, ph: &str| {
+            input(
+                window,
+                cx,
+                v,
+                ph,
+                Accept::Any,
+                |t| t.width(250.).max_len(1024),
+                |t: &mut Self, _, cx| t.refresh_cert_info(cx),
+            )
+        };
+        let ca_path = path_input(window, cx, &saved.mqtt_ca, "CA certificate (optional)");
+        let cert_path = path_input(window, cx, &saved.mqtt_cert, "client certificate .pem/.crt");
+        let key_path = path_input(window, cx, &saved.mqtt_key, "client private key .pem/.key");
         Self {
             focus: cx.focus_handle(),
             broker: input(
@@ -368,8 +405,18 @@ impl MqttView {
                 |t| t,
                 |_: &mut Self, _, _| {},
             ),
-            tls: false,
+            tls: !saved.mqtt_cert.is_empty(),
             insecure: false,
+            auth: if saved.mqtt_cert.is_empty() {
+                Auth::Password
+            } else {
+                Auth::Certificates
+            },
+            ca_path,
+            cert_path,
+            key_path,
+            cert_info: (!saved.mqtt_cert.trim().is_empty())
+                .then(|| mqtt::client_cert_summary(std::path::Path::new(saved.mqtt_cert.trim()))),
             v5: false,
             clean: true,
             sub_qos: 0,
@@ -409,6 +456,199 @@ impl MqttView {
         }
     }
 
+    fn path_value(e: &Entity<TextInput>, cx: &App) -> Option<std::path::PathBuf> {
+        let v = e.read(cx).value.trim().trim_matches('"').to_string();
+        (!v.is_empty()).then(|| std::path::PathBuf::from(v))
+    }
+
+    /// Re-read the client certificate summary shown under the fields.
+    fn refresh_cert_info(&mut self, cx: &mut Context<Self>) {
+        self.cert_info =
+            Self::path_value(&self.cert_path, cx).map(|p| mqtt::client_cert_summary(&p));
+    }
+
+    /// Open the system file picker for one of the certificate fields.
+    fn browse(&mut self, field: FileField, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Select".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let picked = match rx.await {
+                Ok(Ok(Some(mut paths))) if !paths.is_empty() => Ok(paths.remove(0)),
+                Ok(Ok(_)) => return,
+                Ok(Err(e)) => Err(format!(
+                    "File picker unavailable ({e}); type or paste the path instead"
+                )),
+                Err(_) => return,
+            };
+            this.update(cx, |t, cx| {
+                match picked {
+                    Ok(p) => {
+                        let e = match field {
+                            FileField::Ca => t.ca_path.clone(),
+                            FileField::Cert => t.cert_path.clone(),
+                            FileField::Key => t.key_path.clone(),
+                        };
+                        e.update(cx, |i, cx| i.set(p.display().to_string(), cx));
+                        t.refresh_cert_info(cx);
+                    }
+                    Err(e) => t.error = Some(e),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Certificate files for the connection, validated up front.
+    fn tls_files(&self, cx: &App) -> Result<mqtt::TlsFiles, String> {
+        let mut f = mqtt::TlsFiles {
+            ca: Self::path_value(&self.ca_path, cx),
+            client: None,
+        };
+        if self.auth == Auth::Certificates {
+            match (
+                Self::path_value(&self.cert_path, cx),
+                Self::path_value(&self.key_path, cx),
+            ) {
+                (Some(c), Some(k)) => {
+                    mqtt::load_certs(&c, "client certificate")?;
+                    mqtt::load_key(&k)?;
+                    f.client = Some((c, k));
+                }
+                _ => {
+                    return Err(
+                        "Certificates: choose both the client certificate and its private key"
+                            .into(),
+                    );
+                }
+            }
+        }
+        if let Some(ca) = &f.ca {
+            mqtt::load_certs(ca, "CA certificate")?;
+        }
+        Ok(f)
+    }
+
+    fn render_auth(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity().downgrade();
+        let certs = self.auth == Auth::Certificates;
+        let file_row =
+            |id: &'static str, title: &'static str, e: &Entity<TextInput>, f: FileField| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().w(px(92.)).flex_none().child(label(title)))
+                    .child(e.clone())
+                    .child(chip(
+                        id,
+                        "Browse…",
+                        false,
+                        act(&view, move |t: &mut Self, _, cx| t.browse(f, cx)),
+                    ))
+            };
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px_5()
+            .py_2()
+            .bg(rgb(C::PANEL))
+            .border_b_1()
+            .border_color(rgb(C::BORDER))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(label("Authentication"))
+                    .child(chip(
+                        "mq-auth-pw",
+                        "Username / password",
+                        !certs,
+                        act(&view, |t: &mut Self, _, _| t.auth = Auth::Password),
+                    ))
+                    .child(chip(
+                        "mq-auth-cert",
+                        "Certificates (mutual TLS)",
+                        certs,
+                        act(&view, |t: &mut Self, _, cx| {
+                            t.auth = Auth::Certificates;
+                            t.tls = true;
+                            t.refresh_cert_info(cx);
+                        }),
+                    ))
+                    .when(!certs, |d| {
+                        d.child(div().w(px(12.)))
+                            .child(self.user.clone())
+                            .child(self.pass.clone())
+                            .when(self.tls, |d| {
+                                d.child(div().w(px(12.)))
+                                    .child(label("CA"))
+                                    .child(self.ca_path.clone())
+                                    .child(chip(
+                                        "mq-ca-pw",
+                                        "Browse…",
+                                        false,
+                                        act(&view, |t: &mut Self, _, cx| {
+                                            t.browse(FileField::Ca, cx)
+                                        }),
+                                    ))
+                            })
+                    }),
+            )
+            .when(certs, |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_x_5()
+                        .gap_y_2()
+                        .child(file_row(
+                            "mq-ca",
+                            "CA certificate",
+                            &self.ca_path,
+                            FileField::Ca,
+                        ))
+                        .child(file_row(
+                            "mq-cert",
+                            "Client cert",
+                            &self.cert_path,
+                            FileField::Cert,
+                        ))
+                        .child(file_row(
+                            "mq-key",
+                            "Client key",
+                            &self.key_path,
+                            FileField::Key,
+                        )),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(match &self.cert_info {
+                            Some(Ok(_)) => C::GREEN,
+                            Some(Err(_)) => C::RED,
+                            None => C::MUTED,
+                        }))
+                        .child(match &self.cert_info {
+                            Some(Ok(s)) => format!("Client certificate: {s}"),
+                            Some(Err(e)) => e.clone(),
+                            None => "PEM or DER files. The key must not be password-protected. \
+                                     Leave the CA empty to use the system trust store; \
+                                     the connection always uses TLS (default port 8883)."
+                                .into(),
+                        }),
+                )
+            })
+    }
+
     fn running(&self) -> bool {
         self.session.is_some()
     }
@@ -418,7 +658,17 @@ impl MqttView {
             return;
         }
         self.error = None;
-        let (host, port, tls_implied) = match mqtt::parse_broker(&self.broker.read(cx).value) {
+        // Certificates need TLS; with TLS and no explicit port use 8883.
+        if self.auth == Auth::Certificates {
+            self.tls = true;
+        }
+        let raw = self.broker.read(cx).value.trim().to_string();
+        let parsed = if self.tls && !raw.contains("://") {
+            mqtt::parse_broker(&format!("mqtts://{raw}"))
+        } else {
+            mqtt::parse_broker(&raw)
+        };
+        let (host, port, tls_implied) = match parsed {
             Ok(x) => x,
             Err(e) => {
                 self.error = Some(e);
@@ -427,8 +677,37 @@ impl MqttView {
         };
         let tls = self.tls || tls_implied;
         self.tls = tls;
-        let user = self.user.read(cx).value.trim().to_string();
-        let pass = self.pass.read(cx).value.clone();
+        let tls_files = if tls {
+            match self.tls_files(cx) {
+                Ok(f) => f,
+                Err(e) => {
+                    self.error = Some(e);
+                    return;
+                }
+            }
+        } else {
+            mqtt::TlsFiles::default()
+        };
+        {
+            let (ca, cert, key) = (
+                self.ca_path.read(cx).value.trim().to_string(),
+                self.cert_path.read(cx).value.trim().to_string(),
+                self.key_path.read(cx).value.trim().to_string(),
+            );
+            let _ = crate::settings::update(|s| {
+                s.mqtt_ca = ca;
+                s.mqtt_cert = cert;
+                s.mqtt_key = key;
+            });
+        }
+        let (user, pass) = if self.auth == Auth::Password {
+            (
+                self.user.read(cx).value.trim().to_string(),
+                self.pass.read(cx).value.clone(),
+            )
+        } else {
+            (String::new(), String::new())
+        };
         let mut client_id = self.client_id.read(cx).value.trim().to_string();
         if client_id.is_empty() {
             client_id = mqtt::random_client_id();
@@ -448,10 +727,15 @@ impl MqttView {
             clean: self.clean,
             v5: self.v5,
             timeout: Duration::from_secs(10),
+            tls_files,
         };
         self.conn_desc = format!(
             "{host}:{port}{} · MQTT {}",
-            if tls { " TLS" } else { "" },
+            match (tls, self.auth) {
+                (true, Auth::Certificates) => " mutual TLS",
+                (true, _) => " TLS",
+                _ => "",
+            },
             if self.v5 { "5.0" } else { "3.1.1" }
         );
         let (s, rx) = mqtt::connect(cfg);
@@ -1198,8 +1482,6 @@ impl Render for MqttView {
                     ))
                     .child(label("Client ID"))
                     .child(self.client_id.clone())
-                    .child(self.user.clone())
-                    .child(self.pass.clone())
                     .child(label("Keepalive"))
                     .child(self.keepalive.clone())
                     .child(if running {
@@ -1222,6 +1504,7 @@ impl Render for MqttView {
                         )
                     }),
             )
+            .child(self.render_auth(cx))
             .children(self.error.clone().map(|e| {
                 div()
                     .px_5()
