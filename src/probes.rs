@@ -96,6 +96,9 @@ pub async fn grab_banner(ip: Ipv4Addr, port: u16, http_hint: bool) -> Banner {
 /// virtual host on remote servers).
 pub async fn grab_banner_at(ip: IpAddr, port: u16, host: &str, http_hint: bool) -> Banner {
     let mut out = Banner::default();
+    if crate::netinfo::is_print_port(port) {
+        return out; // would be printed on paper
+    }
     let addr = SocketAddr::from((ip, port));
     let Ok(Ok(mut s)) = timeout(Duration::from_millis(1200), TcpStream::connect(addr)).await else {
         return out;
@@ -383,6 +386,9 @@ async fn http_get_url(url: &str, expect_ip: Ipv4Addr) -> Option<String> {
         return None;
     }
     let port: u16 = port.parse().ok()?;
+    if crate::netinfo::is_print_port(port) {
+        return None;
+    }
     let mut s = timeout(Duration::from_millis(1500), TcpStream::connect((ip, port)))
         .await
         .ok()?
@@ -451,5 +457,60 @@ mod tests {
         p.extend_from_slice(&(rd.len() as u16).to_be_bytes());
         p.extend_from_slice(&rd);
         assert_eq!(parse_first_ptr(&p).as_deref(), Some("printer.local"));
+    }
+
+    /// Fake printer: listens on a raw print port and returns every byte that
+    /// clients send while `probe` runs. None if all of those ports are in use.
+    fn bytes_printed_during(probe: impl FnOnce(u16)) -> Option<Vec<u8>> {
+        let l = (9100..=9107).find_map(|p| std::net::TcpListener::bind(("127.0.0.1", p)).ok())?;
+        let port = l.local_addr().unwrap().port();
+        l.set_nonblocking(true).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let printer = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut got = Vec::new();
+            loop {
+                // Read the flag first so a connection made before it was set
+                // is still picked up.
+                let last = flag.load(std::sync::atomic::Ordering::SeqCst);
+                match l.accept() {
+                    Ok((mut c, _)) => {
+                        c.set_nonblocking(false).unwrap();
+                        c.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+                        let mut buf = [0u8; 1024];
+                        if let Ok(n) = c.read(&mut buf) {
+                            got.extend_from_slice(&buf[..n]);
+                        }
+                    }
+                    Err(_) if last => return got,
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        });
+        probe(port);
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        Some(printer.join().unwrap())
+    }
+
+    #[test]
+    fn printers_never_receive_data() {
+        let ip = IpAddr::from([127, 0, 0, 1]);
+        for hint in [false, true] {
+            if let Some(got) = bytes_printed_during(|port| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(grab_banner_at(ip, port, "printer", hint));
+            }) {
+                assert_eq!(String::from_utf8_lossy(&got), "");
+            }
+        }
+        if let Some(got) = bytes_printed_during(|port| {
+            crate::svcdetect::detect(ip, "printer", port, Duration::from_millis(500));
+        }) {
+            assert_eq!(String::from_utf8_lossy(&got), "");
+        }
     }
 }

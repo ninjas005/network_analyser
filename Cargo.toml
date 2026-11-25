@@ -1,6 +1,6 @@
 [package]
 name = "network_analyser"
-version = "1.5.0"
+version = "1.5.1"
 edition = "2024"
 description = "LAN scanner, remote port scanner, packet capture/analyser, serial monitor and Modbus RTU/TCP tool"
 license = "MIT"

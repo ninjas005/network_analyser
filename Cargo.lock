@@ -3938,7 +3938,7 @@ dependencies = [
 
 [[package]]
 name = "network_analyser"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "aes 0.9.4",
  "base64",

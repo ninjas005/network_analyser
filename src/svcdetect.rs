@@ -317,6 +317,10 @@ pub fn detect(ip: IpAddr, host: &str, port: u16, wait: Duration) -> Detection {
         service: crate::netinfo::service_name(port).to_string(),
         ..Default::default()
     };
+    if crate::netinfo::is_print_port(port) {
+        d.detail = "not probed: printers print whatever they receive".into();
+        return d;
+    }
     // Ports where the client speaks first.
     match port {
         6379 if redis(ip, port, wait, &mut d) => return d,

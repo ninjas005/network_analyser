@@ -291,6 +291,14 @@ pub fn service_name(port: u16) -> &'static str {
     }
 }
 
+/// Printer ports that must never be sent a probe. Raw print ports put every
+/// byte they receive on paper, so even an HTTP GET comes out as a junk page.
+/// 9100-9107 = JetDirect/AppSocket, 515 = LPD, 6101 = Zebra raw.
+/// (IPP on 631 is real HTTP and safe to query.)
+pub fn is_print_port(port: u16) -> bool {
+    matches!(port, 515 | 6101 | 9100..=9107)
+}
+
 pub fn is_http_port(port: u16) -> bool {
     service_name(port) == "http"
         || matches!(
@@ -302,6 +310,16 @@ pub fn is_http_port(port: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn print_ports() {
+        for p in [515, 6101, 9100, 9107] {
+            assert!(is_print_port(p));
+        }
+        for p in [80, 631, 9099, 9108] {
+            assert!(!is_print_port(p));
+        }
+    }
 
     #[test]
     fn ranges() {
