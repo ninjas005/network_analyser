@@ -32,6 +32,7 @@ mod flows_view;
 mod gateway;
 mod gateway_view;
 mod httpstream;
+mod mdns;
 mod modbus;
 mod modbus_view;
 mod monitor;
@@ -505,6 +506,9 @@ fn run_cli(range: Option<String>) {
                     }
                     if let Some(t) = &h.http_title {
                         println!("{:<16}   http title: {t}", "");
+                    }
+                    for s in &h.mdns_services {
+                        println!("{:<16}   mdns: {}", "", s.label());
                     }
                     if let Some(u) = &h.upnp {
                         println!(

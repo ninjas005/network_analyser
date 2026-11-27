@@ -31,7 +31,8 @@ What it collects per host:
 | Info | Source |
 |---|---|
 | Alive / ping RTT / TTL | ICMP via system `ping`, TCP connect/RST, kernel ARP table |
-| Hostname | Reverse DNS, unicast mDNS (`.local`), NetBIOS (UDP 137), UPnP friendly name |
+| Hostname | Reverse DNS, mDNS / Bonjour (`.local`, link-wide DNS-SD browse plus unicast lookup), NetBIOS (UDP 137), UPnP friendly name |
+| Bonjour services | Advertised DNS-SD services (AirPlay, Google Cast, IPP printers, HomeKit, SMB, ESPHome, …), device model and friendly name; hosts that only answer mDNS are still listed as live |
 | MAC + vendor | `/proc/net/arp` (or NetBIOS) + IEEE OUI registry |
 | Open ports | TCP connect scan of ~60 common ports (`netinfo::DEFAULT_PORTS`) |
 | Banners | First line of each service (SSH version, FTP, SMTP…), HTTP status / `Server` / `<title>` |
@@ -681,6 +682,7 @@ match, so `raspberry 22` finds Raspberry Pis with SSH open.
 - `src/modbus.rs`, `src/modbus_view.rs` – Modbus RTU/TCP framing, CRC, master thread, scans, passive decoder, Modbus tab
 - `src/scanner.rs` – scan engine (own thread + tokio), fingerprinting
 - `src/probes.rs` – ping, TCP, banners/HTTP, mDNS, NetBIOS, SSDP/UPnP, rDNS
+- `src/mdns.rs` – link-wide mDNS / Bonjour (DNS-SD) browse used by the LAN scanner
 - `src/netinfo.rs` – interfaces, OUI vendors, ranges, port names
 - `src/platform.rs` – per-OS gateway / ARP / MAC / directories (Linux `/proc`, macOS & Windows `route`/`arp`/`ifconfig`/`ipconfig`)
 - `build.rs` – embeds the icon into the Windows `.exe`, delay-loads Npcap's `wpcap.dll`

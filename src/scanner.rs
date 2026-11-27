@@ -12,6 +12,7 @@ use futures::StreamExt;
 use futures::future::join_all;
 use tokio::sync::Semaphore;
 
+use crate::mdns::{self, MdnsMap, MdnsService};
 use crate::netinfo::{self, LocalIface};
 use crate::probes::{self, NetbiosInfo, TcpState, UpnpInfo};
 
@@ -40,6 +41,10 @@ pub struct HostInfo {
     pub ttl: Option<u8>,
     pub dns_name: Option<String>,
     pub mdns_name: Option<String>,
+    /// Name the device advertises over Bonjour ("Living Room TV").
+    pub mdns_friendly: Option<String>,
+    pub mdns_model: Option<String>,
+    pub mdns_services: Vec<MdnsService>,
     pub netbios: Option<NetbiosInfo>,
     pub upnp: Option<UpnpInfo>,
     pub mac: Option<String>,
@@ -64,6 +69,9 @@ impl HostInfo {
             ttl: None,
             dns_name: None,
             mdns_name: None,
+            mdns_friendly: None,
+            mdns_model: None,
+            mdns_services: Vec::new(),
             netbios: None,
             upnp: None,
             mac: None,
@@ -89,6 +97,7 @@ impl HostInfo {
             .clone()
             .or_else(|| self.mdns_name.clone())
             .or_else(|| self.netbios.as_ref().and_then(|n| n.name.clone()))
+            .or_else(|| self.mdns_friendly.clone())
             .or_else(|| self.upnp.as_ref().and_then(|u| u.friendly_name.clone()))
     }
 
@@ -166,8 +175,17 @@ async fn run(cfg: ScanConfig, tx: Sender<ScanEvent>, cancel: Arc<AtomicBool>) {
             intercepted.iter().copied().collect(),
         ));
     }
+    // Bonjour / mDNS browse of the whole link, alongside the per-host probes.
+    let (mdns_tx, mdns_rx) = tokio::sync::watch::channel(None);
+    let iface = cfg.local.as_ref().map(|l| l.ip);
+    let targets = cfg.targets.clone();
+    tokio::spawn(async move {
+        let map = mdns::discover(iface, &targets).await;
+        let _ = mdns_tx.send(Some(Arc::new(map)));
+    });
     let ctx = Arc::new(Ctx {
         intercepted,
+        mdns: mdns_rx,
         // Keep well below the default 1024 fd soft limit.
         sockets: Semaphore::new(384),
         gateway: netinfo::default_gateway().map(|(_, gw)| gw),
@@ -200,6 +218,7 @@ async fn run(cfg: ScanConfig, tx: Sender<ScanEvent>, cancel: Arc<AtomicBool>) {
 
 struct Ctx {
     intercepted: BTreeSet<u16>,
+    mdns: tokio::sync::watch::Receiver<Option<Arc<MdnsMap>>>,
     sockets: Semaphore,
     gateway: Option<Ipv4Addr>,
     local: Option<LocalIface>,
@@ -211,6 +230,15 @@ struct Ctx {
 impl Ctx {
     fn send(&self, idx: usize, h: &HostInfo) {
         let _ = self.tx.send(ScanEvent::Host(idx, Box::new(h.clone())));
+    }
+
+    /// Waits for the link-wide mDNS browse (a few seconds after scan start).
+    async fn mdns(&self) -> Arc<MdnsMap> {
+        let mut rx = self.mdns.clone();
+        match rx.wait_for(|m| m.is_some()).await {
+            Ok(m) => m.clone().unwrap_or_default(),
+            Err(_) => Arc::default(),
+        }
     }
 
     async fn probe(&self, ip: Ipv4Addr, port: u16) -> TcpState {
@@ -288,6 +316,11 @@ async fn scan_host(idx: usize, ip: Ipv4Addr, ctx: &Ctx) {
         h.mac = ctx.local.as_ref().and_then(|l| l.mac.clone());
         h.seen_by.push("local");
     }
+    // Phones and IoT gear often drop ping and every TCP port but still
+    // answer Bonjour.
+    if h.seen_by.is_empty() && ctx.mdns().await.get(&ip).is_some_and(|m| m.responded) {
+        h.seen_by.push("mDNS");
+    }
     if h.seen_by.is_empty() {
         h.status = Status::Dead;
         ctx.send(idx, &h);
@@ -309,12 +342,13 @@ async fn scan_host(idx: usize, ip: Ipv4Addr, ctx: &Ctx) {
         rest.iter()
             .map(|&p| async move { (p, ctx.probe(ip, p).await) }),
     );
-    let (dns, mdns, nb, upnp, more) = futures::join!(
+    let (dns, mdns, nb, upnp, more, browse) = futures::join!(
         probes::reverse_dns(ip),
         probes::mdns_name(ip),
         probes::netbios(ip),
         probes::upnp(ip),
-        port_scan
+        port_scan,
+        ctx.mdns()
     );
     open.extend(
         more.into_iter()
@@ -323,6 +357,21 @@ async fn scan_host(idx: usize, ip: Ipv4Addr, ctx: &Ctx) {
     );
     h.dns_name = dns;
     h.mdns_name = mdns.map(|n| n.trim_end_matches('.').to_string());
+    if let Some(b) = browse.get(&ip) {
+        if h.mdns_name.is_none() {
+            h.mdns_name = b.hostname.clone();
+        }
+        h.mdns_friendly = b.friendly.clone();
+        h.mdns_model = b.model.clone();
+        h.mdns_services = b.services.clone();
+        if h.mac.is_none() && !h.is_self {
+            h.mac = b.mac.clone();
+            h.vendor = h.mac.as_deref().and_then(netinfo::mac_vendor);
+        }
+        if b.responded && !h.seen_by.contains(&"mDNS") {
+            h.seen_by.push("mDNS");
+        }
+    }
     if h.mac.is_none() {
         h.mac = nb.as_ref().and_then(|n| n.mac.clone());
         h.vendor = h.mac.as_deref().and_then(netinfo::mac_vendor);
@@ -389,6 +438,8 @@ fn fingerprint(h: &HostInfo) -> (Option<String>, Option<String>) {
         .to_lowercase();
     let vendor = h.vendor.as_deref().unwrap_or("").to_lowercase();
     let mdns = h.mdns_name.as_deref().unwrap_or("").to_lowercase();
+    let svc = |k: &str| h.mdns_services.iter().any(|s| s.kind == k);
+    let model = h.mdns_model.as_deref().unwrap_or("").to_lowercase();
     let upnp_type = h
         .upnp
         .as_ref()
@@ -418,12 +469,16 @@ fn fingerprint(h: &HostInfo) -> (Option<String>, Option<String>) {
         }
     }
     if os.is_none() {
-        os = if has(62078) {
+        os = if has(62078) || model.starts_with("iphone") || model.starts_with("ipad") {
             Some("iOS / iPadOS".into())
         } else if has(5555) {
             Some("Android".into())
         } else if has(3389) || has(135) {
             Some("Windows".into())
+        } else if model.starts_with("mac") || model.starts_with("imac") {
+            Some("macOS".into())
+        } else if model.starts_with("appletv") || model.starts_with("audioaccessory") {
+            Some("tvOS / HomePod".into())
         } else if vendor.contains("apple") && (has(548) || has(22) || has(7000)) {
             Some("macOS".into())
         } else {
@@ -439,18 +494,49 @@ fn fingerprint(h: &HostInfo) -> (Option<String>, Option<String>) {
         Some("This computer")
     } else if h.is_gateway {
         Some("Router / Gateway")
-    } else if has(9100) || has(515) || has(631) || upnp_type.contains("Printer") {
+    } else if has(9100)
+        || has(515)
+        || has(631)
+        || upnp_type.contains("Printer")
+        || svc("_ipp._tcp")
+        || svc("_printer._tcp")
+        || svc("_pdl-datastream._tcp")
+    {
         Some("Printer")
-    } else if has(62078) || vendor.contains("apple") && mdns.contains("iphone") {
+    } else if has(62078)
+        || vendor.contains("apple") && mdns.contains("iphone")
+        || model.starts_with("iphone")
+        || model.starts_with("ipad")
+    {
         Some("Phone / Tablet (Apple)")
-    } else if has(8008) || has(8009) || upnp_type.contains("MediaRenderer") || has(32400) {
+    } else if has(8008)
+        || has(8009)
+        || upnp_type.contains("MediaRenderer")
+        || has(32400)
+        || svc("_googlecast._tcp")
+        || svc("_amzn-wplay._tcp")
+        || svc("_androidtvremote2._tcp")
+        || svc("_sonos._tcp")
+        || model.starts_with("appletv")
+        || model.starts_with("audioaccessory")
+    {
         Some("TV / Media device")
     } else if has(554) {
         Some("Camera / NVR")
-    } else if has(7000) && vendor.contains("apple") {
+    } else if model.starts_with("mac") || model.starts_with("imac") {
+        Some("Mac")
+    } else if (has(7000) || svc("_airplay._tcp")) && vendor.contains("apple") {
         Some("Apple device (AirPlay)")
     } else if has(445) && (has(5000) || has(548) || has(2049)) {
         Some("NAS / File server")
+    } else if svc("_esphomelib._tcp")
+        || svc("_shelly._tcp")
+        || svc("_hap._tcp")
+        || svc("_hap._udp")
+        || svc("_matter._tcp")
+        || svc("_hue._tcp")
+    {
+        Some("IoT / Smart-home device")
     } else if has(1883) {
         Some("IoT hub")
     } else if has(3389) || has(445) {

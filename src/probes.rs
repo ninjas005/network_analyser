@@ -199,7 +199,7 @@ fn decode_entities(s: &str) -> String {
 
 // ---------------------------------------------------------------- dns helpers
 
-fn read_dns_name(pkt: &[u8], mut pos: usize) -> Option<(String, usize)> {
+pub(crate) fn read_dns_name(pkt: &[u8], mut pos: usize) -> Option<(String, usize)> {
     let mut labels = Vec::new();
     let mut end_pos = None;
     for _ in 0..64 {
@@ -220,7 +220,7 @@ fn read_dns_name(pkt: &[u8], mut pos: usize) -> Option<(String, usize)> {
     Some((labels.join("."), end_pos.unwrap_or(pos)))
 }
 
-fn encode_dns_name(name: &str, out: &mut Vec<u8>) {
+pub(crate) fn encode_dns_name(name: &str, out: &mut Vec<u8>) {
     for label in name.split('.').filter(|l| !l.is_empty()) {
         out.push(label.len() as u8);
         out.extend_from_slice(label.as_bytes());

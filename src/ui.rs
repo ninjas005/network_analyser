@@ -266,7 +266,7 @@ impl ScannerView {
         let path = path.to_string_lossy().into_owned();
         let q = |s: Option<&str>| format!("\"{}\"", s.unwrap_or("").replace('"', "\"\""));
         let mut out = String::from(
-            "ip,status,ping_ms,ttl,hostname,dns,mdns,netbios,workgroup,mac,vendor,device,os,open_ports,http_title,http_server,upnp_name,upnp_model\n",
+            "ip,status,ping_ms,ttl,hostname,dns,mdns,netbios,workgroup,mac,vendor,device,os,open_ports,http_title,http_server,upnp_name,upnp_model,mdns_friendly,mdns_model,mdns_services\n",
         );
         for h in self.hosts.iter().filter(|h| h.is_alive()) {
             let nb = h.netbios.as_ref();
@@ -291,6 +291,15 @@ impl ScannerView {
                     q(h.http_server.as_deref()),
                     q(up.and_then(|u| u.friendly_name.as_deref())),
                     q(up.and_then(|u| u.model.as_deref())),
+                    q(h.mdns_friendly.as_deref()),
+                    q(h.mdns_model.as_deref()),
+                    q(Some(
+                        &h.mdns_services
+                            .iter()
+                            .map(|s| s.label())
+                            .collect::<Vec<_>>()
+                            .join("; "),
+                    )),
                 ]
                 .join(","),
             );
@@ -731,6 +740,8 @@ impl ScannerView {
         let mut names = Vec::new();
         kv(&mut names, "Reverse DNS", h.dns_name.clone());
         kv(&mut names, "mDNS", h.mdns_name.clone());
+        kv(&mut names, "Bonjour name", h.mdns_friendly.clone());
+        kv(&mut names, "Bonjour model", h.mdns_model.clone());
         if let Some(nb) = &h.netbios {
             kv(&mut names, "NetBIOS name", nb.name.clone());
             kv(&mut names, "Workgroup", nb.group.clone());
@@ -754,6 +765,21 @@ impl ScannerView {
             kv(&mut web, "UPnP server", u.server.clone());
         }
         sections.push(("Web / UPnP", web));
+
+        let bonjour = h
+            .mdns_services
+            .iter()
+            .map(|s| {
+                let k = crate::mdns::service_label(&s.kind).to_string();
+                let v = if s.port == 0 {
+                    format!("{} ({})", s.instance, s.kind)
+                } else {
+                    format!("{} ({}:{})", s.instance, s.kind, s.port)
+                };
+                (k, v)
+            })
+            .collect();
+        sections.push(("Bonjour / mDNS services", bonjour));
 
         let ports =
             h.ports.iter().map(|p| {
@@ -979,6 +1005,8 @@ fn matches_search(h: &HostInfo, query: &str) -> bool {
             h.hostname(),
             h.dns_name.clone(),
             h.mdns_name.clone(),
+            h.mdns_friendly.clone(),
+            h.mdns_model.clone(),
             h.mac.clone(),
             h.vendor.clone(),
             h.device_type.clone(),
@@ -993,6 +1021,9 @@ fn matches_search(h: &HostInfo, query: &str) -> bool {
         .into_iter()
         .flatten(),
     );
+    for s in &h.mdns_services {
+        hay.push(s.label());
+    }
     for p in &h.ports {
         hay.push(p.port.to_string());
         hay.push(p.service.to_string());
